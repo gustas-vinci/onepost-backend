@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: onepost-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:5000 --workers 2 --threads 4 --timeout 180
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      - key: DEEPGRAM_KEY
+        sync: false
+
