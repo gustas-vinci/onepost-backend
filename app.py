@@ -84,6 +84,44 @@ def generate():
             except Exception:
                 pass
 
+            # Extract first frame from video for visual analysis
+            try:
+                import cv2
+                import numpy as np
+                with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+                    tmp.write(file_bytes)
+                    tmp_path = tmp.name
+                cap = cv2.VideoCapture(tmp_path)
+                frames_b64 = []
+                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                for pos in [total//4, total//2, (3*total)//4]:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+                    ret, frame = cap.read()
+                    if ret:
+                        _, buf = cv2.imencode('.jpg', frame)
+                        frames_b64.append(base64.b64encode(buf).decode())
+                cap.release()
+                os.unlink(tmp_path)
+                if frames_b64:
+                    msgs = [{"type": "text", "text": f"Analyze these video frames in detail. Content type: {content_type_input}, tone: {tone}. Describe everything: subjects, setting, actions, mood, colors, text visible, products, emotions."}]
+                    for fb in frames_b64:
+                        msgs.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{fb}"}})
+                    vis_resp = requests.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+                        json={"model": "meta-llama/llama-4-scout-17b-16e-instruct", "messages": [{"role": "user", "content": msgs}], "max_tokens": 600},
+                        timeout=30
+                    )
+                    if vis_resp.ok:
+                        visual_desc = vis_resp.json()["choices"][0]["message"]["content"]
+                        if context and len(context) > 20:
+                            context = f"VIDEO TRANSCRIPT: {context}\nVISUAL DESCRIPTION: {visual_desc}"
+                        else:
+                            context = f"VISUAL DESCRIPTION: {visual_desc}"
+                        file_analysis = visual_desc
+            except Exception as ve:
+                pass
+
             if not context:
                 context = f"A {content_type_input} video with {tone} tone"
     else:
