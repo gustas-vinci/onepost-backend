@@ -155,6 +155,128 @@ Generate content for each platform. Return ONLY valid JSON with these exact keys
         return jsonify({"error": str(e)}), 500
 
 
+# ============================================================
+# /regenerate — single platform caption regeneration
+# ============================================================
+@app.route("/regenerate", methods=["POST", "OPTIONS"])
+def regenerate():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    groq_key = os.getenv("GROQ_API_KEY")
+
+    platform = request.form.get("platform", "")
+    platform_name = request.form.get("platform_name", platform)
+    previous_caption = request.form.get("previous_caption", "")
+    attempt = request.form.get("attempt", "1")
+    variation_hint = request.form.get("variation_hint", "different angle and hook")
+    content_type_input = request.form.get("content_type", "personal story")
+    tone = request.form.get("tone", "casual and fun")
+    language = request.form.get("language", "english")
+    user_context = request.form.get("user_context", "")
+
+    if not platform or not previous_caption:
+        return jsonify({"success": False, "error": "Missing platform or previous_caption"}), 400
+
+    if language == "hindi":
+        lang_instruction = "Generate the caption in Hindi only (Devanagari script)."
+    elif language == "both":
+        lang_instruction = "Generate in BOTH English and Hindi. English first, then Hindi below, separated by ---"
+    else:
+        lang_instruction = "Generate the caption in English only."
+
+    # Platform-specific format guidelines (matching your /generate endpoint exactly)
+    platform_formats = {
+        "instagram": "an engaging Instagram caption with emojis and 5-8 relevant hashtags",
+        "reels_script": "a Reels script with HOOK: (attention-grabbing opener) MAIN: (3 key points) CTA: (strong call to action)",
+        "youtube_video": "YouTube content with Title:, Description: (150 words), and Tags: (10 relevant tags)",
+        "youtube_shorts": "a YouTube Shorts script with HOOK: (first 3 seconds) MAIN: (key message) CTA: (subscribe/follow)",
+        "facebook": "a friendly conversational Facebook post telling the full story with emojis",
+        "snapchat": "a fun punchy Snapchat caption under 80 characters with emojis 🔥",
+        "whatsapp": "an engaging WhatsApp status under 150 characters with emojis",
+        "linkedin": "a professional insightful LinkedIn post with value for the network, no hashtag spam",
+        "twitter": "a compelling Twitter/X thread formatted as: 1/ hook 2/ insight 3/ takeaway 4/ CTA",
+        "pinterest": "an SEO-rich Pinterest pin description with keywords and call to action"
+    }
+    format_guideline = platform_formats.get(platform, f"engaging content for {platform_name}")
+
+    ctx_part = f"\nADDITIONAL CONTEXT FROM USER: {user_context}\n" if user_context else ""
+
+    prompt = f"""You are OnePost AI. Generate a FRESH, COMPLETELY NEW caption for {platform_name} ONLY.
+
+The user already saw this caption and wants a noticeably DIFFERENT variation:
+---
+{previous_caption}
+---
+
+CRITICAL RULES:
+1. Generate a COMPLETELY NEW caption with a {variation_hint}.
+2. Do NOT repeat phrases, hooks, opening lines, or structure from the previous caption.
+3. The new caption must feel meaningfully different — different angle, different emotional beat, different word choices.
+4. Format: {format_guideline}
+5. Content type: {content_type_input}
+6. Tone: {tone}
+7. Language: {lang_instruction}
+8. This is regeneration attempt #{attempt} — the user wants noticeably fresh creative output.{ctx_part}
+
+Return ONLY the new caption text. No JSON, no preamble, no explanation, no quotation marks around the caption."""
+
+    try:
+        # Higher temperature for genuine variation; bump per attempt
+        temp = min(0.9 + (int(attempt) - 1) * 0.1, 1.2)
+
+        groq_resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 800,
+                "temperature": temp,
+                "top_p": 0.95
+            },
+            timeout=45
+        )
+
+        if not groq_resp.ok:
+            return jsonify({
+                "success": False,
+                "error": "AI regeneration failed",
+                "details": groq_resp.text
+            }), 502
+
+        new_caption = groq_resp.json()["choices"][0]["message"]["content"].strip()
+
+        # Strip accidental wrapping quotes
+        if len(new_caption) >= 2:
+            if (new_caption.startswith('"') and new_caption.endswith('"')) or \
+               (new_caption.startswith("'") and new_caption.endswith("'")):
+                new_caption = new_caption[1:-1].strip()
+
+        # Strip any "Caption:" or similar lead-ins the model might add
+        new_caption = re.sub(r'^(caption|new caption|here\'?s? (the |a )?(new |fresh )?caption)\s*[:\-]\s*',
+                             '', new_caption, flags=re.IGNORECASE).strip()
+
+        if not new_caption or len(new_caption) < 5:
+            return jsonify({
+                "success": False,
+                "error": "Empty regeneration response"
+            }), 500
+
+        return jsonify({
+            "success": True,
+            "caption": new_caption,
+            "platform": platform,
+            "attempt": int(attempt) if attempt.isdigit() else 1
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Regeneration error: {str(e)}"
+        }), 500
+
+
 def analyze_frames_groq(frames, content_type, tone, groq_key, mime="image/jpeg"):
     """Send frames to Groq vision model for analysis"""
     try:
@@ -187,4 +309,3 @@ def analyze_frames_groq(frames, content_type, tone, groq_key, mime="image/jpeg")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
-
