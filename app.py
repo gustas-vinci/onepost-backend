@@ -530,6 +530,8 @@ def check_quota():
         result = _call_quota_script("check_quota", email, fingerprint, ip, timeout=10)
         # Surface the result to frontend
         retry_after = int(result.get("retry_after_seconds") or 0)
+        # Surface Apps Script error if present (for debugging visibility)
+        upstream_error = result.get("error", "") if not result.get("ok", True) else ""
         return jsonify({
             "success": True,
             "allowed": bool(result.get("allowed", True)),
@@ -538,14 +540,14 @@ def check_quota():
             "limit": int(result.get("limit", 5)),
             "retry_after_seconds": retry_after,
             "retry_after_human": _human_retry_msg(retry_after) if retry_after else "",
-            "note": result.get("_note", "")
+            "note": result.get("_note", "") or upstream_error
         })
     except Exception as e:
         print(f"[check-quota] Unexpected error: {e}")
         # Fail open on unexpected errors
         return jsonify({"success": True, "allowed": True, "used": 0,
                         "remaining": 5, "limit": 5, "retry_after_seconds": 0,
-                        "retry_after_human": ""})
+                        "retry_after_human": "", "note": f"backend_error: {str(e)[:80]}"})
 
 
 @app.route("/record-generation", methods=["POST", "OPTIONS"])
@@ -560,16 +562,18 @@ def record_generation():
         fingerprint = (data.get("fingerprint") or "").strip()
         ip = _client_ip()
 
-        result = _call_quota_script("record_generation", email, fingerprint, ip, timeout=8)
+        result = _call_quota_script("record_generation", email, fingerprint, ip, timeout=10)
+        # Surface Apps Script error if present (so frontend debug overlay shows it)
+        upstream_error = result.get("error", "") if not result.get("ok", True) else ""
         return jsonify({
             "success": True,
             "recorded": bool(result.get("recorded", False)),
-            "note": result.get("_note", "")
+            "row": result.get("row", 0),
+            "note": result.get("_note", "") or upstream_error
         })
     except Exception as e:
         print(f"[record-generation] Unexpected error: {e}")
-        # Don't fail user-facing — just log
-        return jsonify({"success": True, "recorded": False})
+        return jsonify({"success": True, "recorded": False, "note": f"backend_error: {str(e)[:80]}"})
 
 
 # ============================================================
