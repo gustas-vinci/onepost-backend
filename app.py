@@ -472,6 +472,107 @@ def regen_status():
 
 
 # ============================================================
+# /check-quota and /record-generation — persistent generation
+# limits keyed by email + browser fingerprint + IP. Persisted in
+# Google Sheets via Apps Script so the limit survives Render
+# restarts, browser switches, and incognito.
+# Required env var: QUOTA_URL = your Apps Script web app URL
+# ============================================================
+def _call_quota_script(action, email, fingerprint, ip, timeout=10):
+    """Forward a quota action to the Google Apps Script."""
+    quota_url = (os.getenv("QUOTA_URL") or "").strip()
+    if not quota_url:
+        # No quota URL configured — fail open (don't block users on misconfig)
+        return {"ok": True, "allowed": True, "used": 0, "remaining": 5,
+                "limit": 5, "retry_after_seconds": 0,
+                "_note": "QUOTA_URL not configured"}
+    try:
+        r = requests.post(
+            quota_url,
+            json={
+                "action": action,
+                "email": email or "",
+                "fingerprint": fingerprint or "",
+                "ip": ip or ""
+            },
+            timeout=timeout,
+            allow_redirects=True
+        )
+        if not r.ok:
+            print(f"[quota] Apps Script returned {r.status_code}")
+            return {"ok": True, "allowed": True, "_note": f"script_{r.status_code}"}
+        try:
+            return r.json()
+        except Exception:
+            # Apps Script sometimes returns HTML on errors
+            print(f"[quota] Non-JSON response: {r.text[:200]}")
+            return {"ok": True, "allowed": True, "_note": "non_json"}
+    except requests.Timeout:
+        print(f"[quota] Apps Script timeout for action={action}")
+        return {"ok": True, "allowed": True, "_note": "timeout"}
+    except Exception as e:
+        print(f"[quota] Apps Script error: {e}")
+        return {"ok": True, "allowed": True, "_note": "error"}
+
+
+@app.route("/check-quota", methods=["POST", "OPTIONS"])
+def check_quota():
+    """Check if user has remaining generations for the day.
+    Identifies user by email AND fingerprint AND IP — match on ANY = quota counts."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        email = (data.get("email") or "").strip().lower()
+        fingerprint = (data.get("fingerprint") or "").strip()
+        ip = _client_ip()
+
+        result = _call_quota_script("check_quota", email, fingerprint, ip, timeout=10)
+        # Surface the result to frontend
+        retry_after = int(result.get("retry_after_seconds") or 0)
+        return jsonify({
+            "success": True,
+            "allowed": bool(result.get("allowed", True)),
+            "used": int(result.get("used", 0)),
+            "remaining": int(result.get("remaining", 5)),
+            "limit": int(result.get("limit", 5)),
+            "retry_after_seconds": retry_after,
+            "retry_after_human": _human_retry_msg(retry_after) if retry_after else "",
+            "note": result.get("_note", "")
+        })
+    except Exception as e:
+        print(f"[check-quota] Unexpected error: {e}")
+        # Fail open on unexpected errors
+        return jsonify({"success": True, "allowed": True, "used": 0,
+                        "remaining": 5, "limit": 5, "retry_after_seconds": 0,
+                        "retry_after_human": ""})
+
+
+@app.route("/record-generation", methods=["POST", "OPTIONS"])
+def record_generation():
+    """Record a successful generation against this user's quota.
+    Called by frontend AFTER /generate succeeds."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        email = (data.get("email") or "").strip().lower()
+        fingerprint = (data.get("fingerprint") or "").strip()
+        ip = _client_ip()
+
+        result = _call_quota_script("record_generation", email, fingerprint, ip, timeout=8)
+        return jsonify({
+            "success": True,
+            "recorded": bool(result.get("recorded", False)),
+            "note": result.get("_note", "")
+        })
+    except Exception as e:
+        print(f"[record-generation] Unexpected error: {e}")
+        # Don't fail user-facing — just log
+        return jsonify({"success": True, "recorded": False})
+
+
+# ============================================================
 # /regenerate — single platform caption regeneration
 # Rate limited: REGEN_LIMIT regenerations per IP per REGEN_WINDOW_SEC
 # ============================================================
