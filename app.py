@@ -75,6 +75,49 @@ def _human_retry_msg(seconds):
     return f"Try again in {hours}h {rem_minutes}m."
 
 # ============================================================
+# Disposable Email Domain List (cached, refreshed every 24h)
+# ============================================================
+DISPOSABLE_DOMAINS_CACHE = {"set": None, "loaded_at": 0}
+_disposable_lock = threading.Lock()
+
+def load_disposable_domains():
+    """Load ~10K disposable domains from public GitHub list. Cached for 24h."""
+    now = time.time()
+    with _disposable_lock:
+        cache = DISPOSABLE_DOMAINS_CACHE
+        if cache["set"] is not None and (now - cache["loaded_at"]) < 86400:
+            return cache["set"]
+        try:
+            url = "https://raw.githubusercontent.com/disposable-email-domains/disposable-email-domains/main/disposable_email_blocklist.conf"
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                domains = {line.strip().lower() for line in r.text.splitlines() if line.strip() and not line.startswith("#")}
+                cache["set"] = domains
+                cache["loaded_at"] = now
+                print(f"[check-email] Loaded {len(domains)} disposable domains")
+                return domains
+        except Exception as e:
+            print(f"[check-email] Disposable list load failed: {e}")
+        # Fallback minimal set if network fails
+        fallback = {
+            "10minutemail.com", "tempmail.com", "guerrillamail.com", "mailinator.com",
+            "throwawaymail.com", "trashmail.com", "yopmail.com", "tempmail.net",
+            "temp-mail.org", "mail.tm", "fakeinbox.com", "sharklasers.com",
+            "getnada.com", "maildrop.cc", "mintemail.com", "spamgourmet.com",
+            "mytemp.email", "33mail.com", "mohmal.com", "emailondeck.com",
+        }
+        cache["set"] = fallback
+        cache["loaded_at"] = now
+        return fallback
+
+# Patterns that strongly suggest disposable even if domain isn't on list
+DISPOSABLE_PATTERNS = [
+    r"temp.*mail", r"throwaway", r"trash.?mail", r"guerrilla", r"10minute",
+    r"disposable", r"mailinator", r"yopmail", r"fakeinbox", r"burner.?mail",
+    r"\.ml$", r"\.tk$", r"\.ga$", r"\.cf$",  # free TLDs heavily abused
+]
+
+# ============================================================
 
 @app.after_request
 def add_headers(response):
@@ -171,6 +214,93 @@ def verify_signup():
             "score": None,
             "message": f"Verifier error: {str(e)[:100]}"
         })
+
+
+# ============================================================
+# /check-email — validates that an email address actually exists
+# Layers:
+#   1. Format validation (regex)
+#   2. Disposable domain blocklist (~10K domains, cached 24h)
+#   3. Disposable pattern matching (catches new disposable domains)
+#   4. Abstract API SMTP/MX deliverability check (real existence)
+# All checks fail OPEN on infrastructure errors — never block real
+# users due to OUR problems (API timeout, network failure, etc.)
+# ============================================================
+@app.route("/check-email", methods=["POST", "OPTIONS"])
+def check_email():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        email = (data.get("email") or "").strip().lower()
+
+        # 1. Format check
+        if not email or "@" not in email:
+            return jsonify({"valid": False, "reason": "Please enter a valid email address."})
+        if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", email):
+            return jsonify({"valid": False, "reason": "Please enter a valid email address."})
+
+        domain = email.split("@", 1)[1]
+
+        # 2. Disposable domain list check
+        disposable = load_disposable_domains()
+        if domain in disposable:
+            return jsonify({"valid": False, "reason": "Please use a real email — disposable addresses aren't allowed."})
+
+        # 3. Pattern check (catches new disposable domains not yet on the list)
+        for pattern in DISPOSABLE_PATTERNS:
+            if re.search(pattern, email, re.IGNORECASE):
+                return jsonify({"valid": False, "reason": "Please use a real email — disposable addresses aren't allowed."})
+
+        # 4. SMTP / deliverability check via Abstract API
+        api_key = (os.getenv("ABSTRACT_API_KEY") or "").strip()
+        if not api_key:
+            # No API key = skip deep check, but log it
+            print("[check-email] No ABSTRACT_API_KEY set — skipping deliverability check")
+            return jsonify({"valid": True, "reason": "OK (deliverability check skipped)"})
+
+        try:
+            api_url = f"https://emailvalidation.abstractapi.com/v1/?api_key={api_key}&email={email}"
+            r = requests.get(api_url, timeout=8)
+            if r.status_code != 200:
+                # API failure = fail OPEN (don't block real users due to our problem)
+                print(f"[check-email] Abstract API returned {r.status_code} — failing open")
+                return jsonify({"valid": True, "reason": "OK (verifier unavailable)"})
+
+            result = r.json()
+            deliverability = (result.get("deliverability") or "").upper()
+            is_smtp_valid = (result.get("is_smtp_valid") or {}).get("value", True)
+            is_mx_found = (result.get("is_mx_found") or {}).get("value", True)
+            is_disposable = (result.get("is_disposable_email") or {}).get("value", False)
+
+            # Log score for analytics
+            print(f"[check-email] {email} → deliverability={deliverability}, smtp={is_smtp_valid}, mx={is_mx_found}, disposable={is_disposable}")
+
+            if is_disposable:
+                return jsonify({"valid": False, "reason": "Please use a real email — disposable addresses aren't allowed."})
+            if not is_mx_found:
+                return jsonify({"valid": False, "reason": "This email domain doesn't accept mail. Please check the spelling."})
+            if not is_smtp_valid:
+                return jsonify({"valid": False, "reason": "This email address doesn't seem to exist. Please check the spelling."})
+            if deliverability == "UNDELIVERABLE":
+                return jsonify({"valid": False, "reason": "This email address doesn't seem to exist. Please check the spelling."})
+
+            # DELIVERABLE, RISKY, or UNKNOWN → allow
+            return jsonify({"valid": True, "reason": "OK", "deliverability": deliverability})
+
+        except requests.Timeout:
+            print(f"[check-email] Abstract API timeout for {email} — failing open")
+            return jsonify({"valid": True, "reason": "OK (verifier timeout)"})
+        except Exception as api_err:
+            print(f"[check-email] Abstract API error: {api_err} — failing open")
+            return jsonify({"valid": True, "reason": "OK (verifier error)"})
+
+    except Exception as e:
+        print(f"[check-email] Unexpected error: {e}")
+        # Fail open on unexpected errors — don't block signups due to our bugs
+        return jsonify({"valid": True, "reason": "OK (check error)"})
+
 
 @app.route("/generate", methods=["POST", "OPTIONS"])
 def generate():
