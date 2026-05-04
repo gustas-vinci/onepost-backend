@@ -2,7 +2,10 @@ import os
 import json
 import base64
 import re
+import time
+import threading
 import requests
+from collections import deque
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -10,6 +13,68 @@ from flask_cors import CORS
 load_dotenv()
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+# ============================================================
+# Rate Limiting (IP-based, in-memory)
+# ============================================================
+# REGEN_LIMIT regenerations per IP within REGEN_WINDOW_SEC.
+# Storage is in-memory: { ip: deque([timestamps...]) }
+# Lost on server restart (Render free tier sleeps after ~15min idle).
+# That's an acceptable tradeoff for a beta — bypass via VPN/different
+# network is also possible, this is best-effort soft enforcement.
+REGEN_LIMIT = 5
+REGEN_WINDOW_SEC = 24 * 60 * 60  # 24 hours
+_regen_log = {}
+_regen_lock = threading.Lock()
+
+def _client_ip():
+    """Return the real end-user IP, accounting for Cloudflare proxy."""
+    cf_ip = request.headers.get("CF-Connecting-IP")
+    if cf_ip:
+        return cf_ip.strip()
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+def check_regen_limit(ip):
+    """Returns (allowed: bool, remaining: int, retry_after_sec: int)."""
+    now = time.time()
+    cutoff = now - REGEN_WINDOW_SEC
+    with _regen_lock:
+        dq = _regen_log.get(ip)
+        if dq is None:
+            dq = deque()
+            _regen_log[ip] = dq
+        # Drop old entries outside the window
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        used = len(dq)
+        if used >= REGEN_LIMIT:
+            retry_after = int(dq[0] + REGEN_WINDOW_SEC - now) + 1
+            return False, 0, retry_after
+        return True, REGEN_LIMIT - used, 0
+
+def record_regen(ip):
+    """Record a successful regeneration against this IP's quota."""
+    with _regen_lock:
+        dq = _regen_log.setdefault(ip, deque())
+        dq.append(time.time())
+
+def _human_retry_msg(seconds):
+    """Convert seconds → friendly message."""
+    if seconds < 60:
+        return f"Try again in {seconds} seconds."
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"Try again in {minutes} minute{'s' if minutes != 1 else ''}."
+    hours = minutes // 60
+    rem_minutes = minutes % 60
+    if rem_minutes == 0:
+        return f"Try again in {hours} hour{'s' if hours != 1 else ''}."
+    return f"Try again in {hours}h {rem_minutes}m."
+
+# ============================================================
 
 @app.after_request
 def add_headers(response):
@@ -21,6 +86,91 @@ def add_headers(response):
 @app.route("/")
 def home():
     return jsonify({"status": "OnePost backend live"})
+
+# ============================================================
+# /verify-signup — verifies reCAPTCHA v3 token before allowing
+# the frontend to log a signup. Frontend MUST send token from
+# grecaptcha.execute() in the request body.
+# ============================================================
+@app.route("/verify-signup", methods=["POST", "OPTIONS"])
+def verify_signup():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    secret = os.getenv("RECAPTCHA_SECRET")
+    if not secret:
+        # If secret not configured, fail OPEN (don't block real users in case of misconfig)
+        return jsonify({
+            "success": True,
+            "allowed": True,
+            "score": None,
+            "message": "Verification skipped (no key configured)"
+        })
+
+    # Parse JSON body
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        payload = {}
+    token = payload.get("token", "")
+    email = payload.get("email", "")
+
+    if not token:
+        # No token from frontend (script blocked, ad-blocker, etc.) — fail OPEN
+        # This prevents legitimate users with strict privacy settings from being locked out.
+        return jsonify({
+            "success": True,
+            "allowed": True,
+            "score": None,
+            "message": "No captcha token (allowed by default)"
+        })
+
+    # Verify with Google
+    try:
+        r = requests.post(
+            "https://www.google.com/recaptcha/api/siteverify",
+            data={"secret": secret, "response": token, "remoteip": _client_ip()},
+            timeout=8
+        )
+        if not r.ok:
+            return jsonify({"success": True, "allowed": True, "score": None,
+                            "message": "Verifier unreachable (allowed)"})
+        data = r.json()
+        success = bool(data.get("success"))
+        score = data.get("score", 0.0)
+        action = data.get("action", "")
+        # reCAPTCHA v3 returns 0.0 (very likely bot) → 1.0 (very likely human)
+        # Threshold 0.5 is Google's default recommendation
+        threshold = 0.5
+        if not success:
+            return jsonify({
+                "success": True,
+                "allowed": False,
+                "score": score,
+                "message": "Verification failed. Please refresh and try again."
+            })
+        if score < threshold:
+            return jsonify({
+                "success": True,
+                "allowed": False,
+                "score": score,
+                "message": "Suspicious activity detected. Please try again or contact support."
+            })
+        return jsonify({
+            "success": True,
+            "allowed": True,
+            "score": score,
+            "action": action,
+            "message": "OK"
+        })
+    except Exception as e:
+        # Network error or Google outage — fail OPEN
+        return jsonify({
+            "success": True,
+            "allowed": True,
+            "score": None,
+            "message": f"Verifier error: {str(e)[:100]}"
+        })
 
 @app.route("/generate", methods=["POST", "OPTIONS"])
 def generate():
@@ -172,12 +322,47 @@ Generate content for each platform. Return ONLY valid JSON with these exact keys
 
 
 # ============================================================
+# /regen-status — frontend can fetch remaining count anytime
+# ============================================================
+@app.route("/regen-status", methods=["GET", "OPTIONS"])
+def regen_status():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+    ip = _client_ip()
+    allowed, remaining, retry_after = check_regen_limit(ip)
+    return jsonify({
+        "success": True,
+        "allowed": allowed,
+        "remaining": remaining,
+        "limit": REGEN_LIMIT,
+        "window_hours": REGEN_WINDOW_SEC // 3600,
+        "retry_after_seconds": retry_after,
+        "retry_after_human": _human_retry_msg(retry_after) if retry_after else ""
+    })
+
+
+# ============================================================
 # /regenerate — single platform caption regeneration
+# Rate limited: REGEN_LIMIT regenerations per IP per REGEN_WINDOW_SEC
 # ============================================================
 @app.route("/regenerate", methods=["POST", "OPTIONS"])
 def regenerate():
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
+
+    # ---- Rate limit check (IP-based, total across all platforms) ----
+    ip = _client_ip()
+    allowed, remaining, retry_after = check_regen_limit(ip)
+    if not allowed:
+        return jsonify({
+            "success": False,
+            "error": "regen_limit_reached",
+            "message": f"You've used all {REGEN_LIMIT} regenerations for today. {_human_retry_msg(retry_after)}",
+            "limit": REGEN_LIMIT,
+            "remaining": 0,
+            "retry_after_seconds": retry_after,
+            "retry_after_human": _human_retry_msg(retry_after)
+        }), 429
 
     groq_key = os.getenv("GROQ_API_KEY")
 
@@ -294,11 +479,17 @@ Return ONLY the new caption text. No JSON, no preamble, no explanation, no quota
                 "error": "Empty regeneration response"
             }), 500
 
+        # ---- Record successful regeneration against the IP's quota ----
+        record_regen(ip)
+        _, remaining_after, _ = check_regen_limit(ip)
+
         return jsonify({
             "success": True,
             "caption": new_caption,
             "platform": platform,
-            "attempt": int(attempt) if attempt.isdigit() else 1
+            "attempt": int(attempt) if attempt.isdigit() else 1,
+            "remaining": remaining_after,
+            "limit": REGEN_LIMIT
         })
 
     except Exception as e:
