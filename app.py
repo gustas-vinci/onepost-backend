@@ -483,8 +483,8 @@ def _call_quota_script(action, email, fingerprint, ip, timeout=10):
     quota_url = (os.getenv("QUOTA_URL") or "").strip()
     if not quota_url:
         # No quota URL configured — fail open (don't block users on misconfig)
-        return {"ok": True, "allowed": True, "used": 0, "remaining": 5,
-                "limit": 5, "retry_after_seconds": 0,
+        return {"ok": True, "allowed": True, "used": 0, "remaining": 3,
+                "limit": 3, "retry_after_seconds": 0,
                 "_note": "QUOTA_URL not configured"}
     try:
         r = requests.post(
@@ -536,8 +536,8 @@ def check_quota():
             "success": True,
             "allowed": bool(result.get("allowed", True)),
             "used": int(result.get("used", 0)),
-            "remaining": int(result.get("remaining", 5)),
-            "limit": int(result.get("limit", 5)),
+            "remaining": int(result.get("remaining", 3)),
+            "limit": int(result.get("limit", 3)),
             "retry_after_seconds": retry_after,
             "retry_after_human": _human_retry_msg(retry_after) if retry_after else "",
             "note": result.get("_note", "") or upstream_error
@@ -546,7 +546,7 @@ def check_quota():
         print(f"[check-quota] Unexpected error: {e}")
         # Fail open on unexpected errors
         return jsonify({"success": True, "allowed": True, "used": 0,
-                        "remaining": 5, "limit": 5, "retry_after_seconds": 0,
+                        "remaining": 3, "limit": 3, "retry_after_seconds": 0,
                         "retry_after_human": "", "note": f"backend_error: {str(e)[:80]}"})
 
 
