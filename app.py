@@ -22,7 +22,12 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # Lost on server restart (Render free tier sleeps after ~15min idle).
 # That's an acceptable tradeoff for a beta — bypass via VPN/different
 # network is also possible, this is best-effort soft enforcement.
-REGEN_LIMIT = 5
+# Backend regen limit was REDUNDANT with Apps Script quota system.
+# Apps Script enforces 3 generations/day already. The backend limit was hitting
+# users who only tried to regenerate once because the in-memory counter
+# accumulated across testing sessions. Setting to a high number effectively
+# disables this layer; the Apps Script quota system (3/day) is the real gate.
+REGEN_LIMIT = 999
 REGEN_WINDOW_SEC = 24 * 60 * 60  # 24 hours
 _regen_log = {}
 _regen_lock = threading.Lock()
