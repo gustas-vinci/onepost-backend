@@ -15,6 +15,46 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ============================================================
+# OPTIONAL DEPENDENCIES — Clerk webhook + Supabase client
+# ============================================================
+# These imports and the supabase client init are wrapped in try/except so
+# that if the libs are missing OR misconfigured, the rest of the app keeps
+# working. The new /api/clerk-webhook endpoint will return a clear error,
+# but anonymous users will not be affected.
+_AUTH_DEPS_OK = False
+_AUTH_DEPS_ERR = ""
+_supabase_client = None
+try:
+    from svix.webhooks import Webhook as SvixWebhook  # for Clerk webhook signature verification
+    from supabase import create_client as _create_supabase_client  # supabase-py
+    _AUTH_DEPS_OK = True
+    print("[auth-deps] svix and supabase libs imported OK")
+except Exception as _imp_err:
+    _AUTH_DEPS_ERR = f"import_failed: {str(_imp_err)[:160]}"
+    print(f"[auth-deps] {_AUTH_DEPS_ERR}")
+
+def _get_supabase():
+    """Lazy-init the Supabase client. Returns None if unavailable.
+    Never raises — callers handle None as 'auth temporarily unavailable'."""
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+    if not _AUTH_DEPS_OK:
+        return None
+    url = (os.getenv("SUPABASE_URL") or "").strip()
+    key = (os.getenv("SUPABASE_SERVICE_KEY") or "").strip()
+    if not url or not key:
+        print("[supabase] SUPABASE_URL or SUPABASE_SERVICE_KEY missing")
+        return None
+    try:
+        _supabase_client = _create_supabase_client(url, key)
+        print("[supabase] client initialized")
+        return _supabase_client
+    except Exception as e:
+        print(f"[supabase] init failed: {e}")
+        return None
+
+# ============================================================
 # Rate Limiting (IP-based, in-memory)
 # ============================================================
 # REGEN_LIMIT regenerations per IP within REGEN_WINDOW_SEC.
@@ -767,6 +807,161 @@ def analyze_frames_groq(frames, content_type, tone, groq_key, mime="image/jpeg")
         return ""
     except Exception:
         return ""
+
+
+# ============================================================
+# /api/clerk-webhook — receives user lifecycle events from Clerk
+# Subscribes to: user.created, user.updated, user.deleted
+# On user.created: inserts a row in Supabase users table with bonus_credits=2
+# On user.updated: keeps email/name in sync
+# On user.deleted: removes the user row (cascades to usage_logs)
+#
+# SECURITY: Verifies the Svix webhook signature using CLERK_WEBHOOK_SECRET.
+# Without verification, anyone could POST fake user_created events to us.
+# ============================================================
+@app.route("/api/clerk-webhook", methods=["POST", "OPTIONS"])
+def clerk_webhook():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    # Step 1 — fail fast if the optional auth deps didn't import
+    if not _AUTH_DEPS_OK:
+        print(f"[clerk-webhook] auth deps unavailable: {_AUTH_DEPS_ERR}")
+        return jsonify({"ok": False, "error": _AUTH_DEPS_ERR}), 503
+
+    # Step 2 — verify the webhook signature using Svix
+    webhook_secret = (os.getenv("CLERK_WEBHOOK_SECRET") or "").strip()
+    if not webhook_secret:
+        print("[clerk-webhook] CLERK_WEBHOOK_SECRET not configured")
+        return jsonify({"ok": False, "error": "webhook_secret_missing"}), 503
+
+    # Svix expects the raw body bytes for signature verification
+    raw_body = request.get_data()
+    headers = {
+        "svix-id": request.headers.get("svix-id", ""),
+        "svix-timestamp": request.headers.get("svix-timestamp", ""),
+        "svix-signature": request.headers.get("svix-signature", ""),
+    }
+    if not all(headers.values()):
+        print(f"[clerk-webhook] missing svix headers: {headers}")
+        return jsonify({"ok": False, "error": "missing_svix_headers"}), 400
+
+    try:
+        wh = SvixWebhook(webhook_secret)
+        # verify() raises on bad signature; returns the parsed JSON payload on success
+        payload = wh.verify(raw_body, headers)
+    except Exception as e:
+        print(f"[clerk-webhook] signature verification failed: {e}")
+        return jsonify({"ok": False, "error": "bad_signature"}), 401
+
+    # Step 3 — extract event type and user data
+    event_type = payload.get("type", "")
+    data = payload.get("data", {}) or {}
+    clerk_user_id = data.get("id", "")
+
+    print(f"[clerk-webhook] received event_type={event_type} user_id={clerk_user_id}")
+
+    if not clerk_user_id:
+        return jsonify({"ok": False, "error": "missing_user_id"}), 400
+
+    # Step 4 — get Supabase client
+    supa = _get_supabase()
+    if supa is None:
+        # We accept the webhook (return 200) so Clerk doesn't endlessly retry,
+        # but log loud so we know something's wrong.
+        print("[clerk-webhook] Supabase unavailable — accepting webhook without writing")
+        return jsonify({"ok": True, "warn": "supabase_unavailable"}), 200
+
+    # Step 5 — extract email and name from the payload
+    # Clerk payload shape: data.email_addresses is a list of {id, email_address, ...}
+    # data.primary_email_address_id points to the primary one
+    email = ""
+    try:
+        email_list = data.get("email_addresses", []) or []
+        primary_id = data.get("primary_email_address_id", "")
+        for em in email_list:
+            if em.get("id") == primary_id:
+                email = (em.get("email_address") or "").strip().lower()
+                break
+        # Fallback — first email if primary not found
+        if not email and email_list:
+            email = (email_list[0].get("email_address") or "").strip().lower()
+    except Exception as e:
+        print(f"[clerk-webhook] email parse error: {e}")
+
+    first_name = (data.get("first_name") or "").strip()
+    last_name = (data.get("last_name") or "").strip()
+    name = (first_name + " " + last_name).strip() or (data.get("username") or "").strip()
+
+    # Step 6 — handle the event (idempotent operations)
+    try:
+        if event_type == "user.created":
+            # Idempotent insert: if row already exists, this raises a duplicate key error
+            # which we catch and treat as success (Clerk sometimes resends events)
+            row = {
+                "id": clerk_user_id,
+                "email": email or f"{clerk_user_id}@unknown.local",  # email is required (UNIQUE NOT NULL)
+                "name": name or None,
+                "bonus_credits": 2,
+                "daily_used": 0,
+            }
+            try:
+                supa.table("users").insert(row).execute()
+                print(f"[clerk-webhook] inserted user {clerk_user_id} ({email})")
+            except Exception as ins_err:
+                err_str = str(ins_err)
+                # Detect duplicate-key (idempotent retry) vs real error
+                if "duplicate key" in err_str.lower() or "23505" in err_str:
+                    print(f"[clerk-webhook] user {clerk_user_id} already exists — idempotent OK")
+                else:
+                    raise
+
+        elif event_type == "user.updated":
+            # Update email and name only. Don't touch bonus_credits or daily_used.
+            update_fields = {}
+            if email:
+                update_fields["email"] = email
+            if name:
+                update_fields["name"] = name
+            if update_fields:
+                supa.table("users").update(update_fields).eq("id", clerk_user_id).execute()
+                print(f"[clerk-webhook] updated user {clerk_user_id}")
+
+        elif event_type == "user.deleted":
+            # Delete cascades to usage_logs via FK ON DELETE CASCADE
+            supa.table("users").delete().eq("id", clerk_user_id).execute()
+            print(f"[clerk-webhook] deleted user {clerk_user_id}")
+
+        else:
+            # Unknown event type — accept (200) so Clerk doesn't retry, but log
+            print(f"[clerk-webhook] ignoring unknown event_type={event_type}")
+
+        return jsonify({"ok": True, "event": event_type, "user_id": clerk_user_id}), 200
+
+    except Exception as e:
+        print(f"[clerk-webhook] supabase operation failed: {e}")
+        # Return 500 so Clerk retries (transient errors should self-heal)
+        return jsonify({"ok": False, "error": f"db_error: {str(e)[:160]}"}), 500
+
+
+# ============================================================
+# /api/auth-debug — diagnostic endpoint, safe to call anytime.
+# Reports whether auth deps are configured correctly. Does NOT
+# expose any secrets — only their PRESENCE/ABSENCE and lengths.
+# ============================================================
+@app.route("/api/auth-debug", methods=["GET", "OPTIONS"])
+def auth_debug():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+    supa = _get_supabase()
+    return jsonify({
+        "auth_deps_imported": _AUTH_DEPS_OK,
+        "auth_deps_error": _AUTH_DEPS_ERR if not _AUTH_DEPS_OK else "",
+        "supabase_url_set": bool((os.getenv("SUPABASE_URL") or "").strip()),
+        "supabase_key_set": bool((os.getenv("SUPABASE_SERVICE_KEY") or "").strip()),
+        "clerk_webhook_secret_set": bool((os.getenv("CLERK_WEBHOOK_SECRET") or "").strip()),
+        "supabase_client_ready": supa is not None,
+    })
 
 
 if __name__ == "__main__":
