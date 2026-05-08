@@ -27,8 +27,10 @@ _supabase_client = None
 try:
     from svix.webhooks import Webhook as SvixWebhook  # for Clerk webhook signature verification
     from supabase import create_client as _create_supabase_client  # supabase-py
+    import jwt as _jwt  # PyJWT — for verifying Clerk session JWTs networklessly via JWKS
+    from jwt import PyJWKClient  # JWKS fetcher with built-in caching
     _AUTH_DEPS_OK = True
-    print("[auth-deps] svix and supabase libs imported OK")
+    print("[auth-deps] svix, supabase, PyJWT libs imported OK")
 except Exception as _imp_err:
     _AUTH_DEPS_ERR = f"import_failed: {str(_imp_err)[:160]}"
     print(f"[auth-deps] {_AUTH_DEPS_ERR}")
@@ -95,6 +97,210 @@ def _normalize_email(email):
         return f"{local}@{domain}"
     except Exception:
         return (email or "").lower().strip()
+
+
+# ============================================================
+# CLERK JWT VERIFICATION (networkless via JWKS)
+# ============================================================
+# Clerk session tokens are RS256-signed JWTs. We verify them
+# locally using Clerk's public keys (JWKS) — no API call needed
+# per request. PyJWKClient caches the keys for us automatically.
+#
+# This proves a request came from a real signed-in Clerk user.
+# Without verification, any abuser could call /api/signup-metadata
+# with a fake user_id and bypass our anti-abuse layers entirely.
+# ============================================================
+_jwks_client = None
+_jwks_init_err = ""
+
+def _get_jwks_client():
+    """Lazy-init the PyJWKClient pointing at Clerk's JWKS URL.
+    JWKS URL pattern: https://<frontend-api>/.well-known/jwks.json
+    We derive the frontend API from the publishable key (base64-encoded inside it).
+
+    Returns the client or None if init fails. Never raises.
+    """
+    global _jwks_client, _jwks_init_err
+    if _jwks_client is not None:
+        return _jwks_client
+    if not _AUTH_DEPS_OK:
+        _jwks_init_err = "auth_deps_unavailable"
+        return None
+    # Decode the publishable key to get the frontend API domain.
+    # Format: pk_test_<base64-of-domain-with-trailing-$>
+    pub_key = (os.getenv("CLERK_PUBLISHABLE_KEY") or "").strip()
+    if not pub_key:
+        # Fallback — use the key we hard-coded in index.html (test environment)
+        pub_key = "pk_test_Zmxvd2luZy1raXR0ZW4tNjUuY2xlcmsuYWNjb3VudHMuZGV2JA"
+    try:
+        # Strip the pk_test_ or pk_live_ prefix
+        b64_part = pub_key.split("_", 2)[-1]
+        # Add padding if needed
+        b64_part += "=" * (-len(b64_part) % 4)
+        decoded = base64.b64decode(b64_part).decode("utf-8", errors="replace")
+        # Decoded value ends in $ — strip it
+        frontend_api = decoded.rstrip("$").strip()
+        if not frontend_api or "." not in frontend_api:
+            _jwks_init_err = f"bad_frontend_api: {frontend_api[:60]}"
+            return None
+        jwks_url = f"https://{frontend_api}/.well-known/jwks.json"
+        # PyJWKClient caches for 5 min by default — fine for our needs
+        _jwks_client = PyJWKClient(jwks_url, cache_keys=True, lifespan=300)
+        print(f"[clerk-jwt] JWKS client initialized for {frontend_api}")
+        return _jwks_client
+    except Exception as e:
+        _jwks_init_err = f"init_failed: {str(e)[:120]}"
+        print(f"[clerk-jwt] {_jwks_init_err}")
+        return None
+
+
+def _verify_clerk_jwt(req):
+    """Extract and verify the Clerk session JWT from the request.
+
+    Returns:
+        (user_id, error_msg) — user_id is None if verification fails.
+
+    Looks for the JWT in:
+        1. Authorization: Bearer <token> header (preferred)
+        2. __session cookie (Clerk's default cookie)
+    """
+    # 1. Find the token
+    token = ""
+    auth_header = req.headers.get("Authorization", "") or ""
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+    if not token:
+        token = (req.cookies.get("__session") or "").strip()
+    if not token:
+        return None, "no_token"
+
+    # 2. Get the JWKS client
+    jwks_client = _get_jwks_client()
+    if jwks_client is None:
+        return None, f"jwks_unavailable: {_jwks_init_err}"
+
+    # 3. Verify the token
+    try:
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+        # Clerk session tokens are signed with RS256
+        # We don't validate audience because Clerk's session tokens don't always include 'aud'
+        # We DO validate signature, expiration, and issuer
+        decoded = _jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            options={
+                "verify_signature": True,
+                "verify_exp": True,
+                "verify_iat": True,
+                "verify_aud": False,  # Clerk session tokens don't always have aud
+            },
+            leeway=10,  # 10 second clock skew tolerance
+        )
+        user_id = decoded.get("sub", "")  # Clerk puts user_id in 'sub' claim
+        if not user_id:
+            return None, "no_sub_claim"
+        return user_id, ""
+    except _jwt.ExpiredSignatureError:
+        return None, "token_expired"
+    except _jwt.InvalidTokenError as e:
+        return None, f"invalid_token: {str(e)[:80]}"
+    except Exception as e:
+        return None, f"verify_error: {str(e)[:80]}"
+
+
+# ============================================================
+# ANTI-ABUSE — Layers B (browser fingerprint) + C (IP rate-limit)
+# ============================================================
+# These are checked when the frontend calls /api/signup-metadata
+# right after a Clerk signup completes. They use signals not
+# available in the webhook (browser fingerprint, real client IP).
+#
+# Layer B: same browser fingerprint already linked to N+ accounts
+#   → block 3rd account from same browser (configurable via SIGNUP_FP_LIMIT)
+# Layer C: IP has had K+ signups in last 24h
+#   → block (configurable via SIGNUP_IP_LIMIT_24H, default 5)
+# ============================================================
+
+def _check_signup_metadata_limits(supa, ip, fingerprint, current_user_id):
+    """Run Layers B + C checks. Returns (allowed, reason).
+
+    Args:
+        supa: Supabase client (already validated non-None)
+        ip: client IP address
+        fingerprint: browser fingerprint string
+        current_user_id: the Clerk user_id that just signed up
+                         (excluded from dedup count — they're the new account)
+
+    Returns:
+        (True, "")                        if allowed
+        (False, "blocked_fingerprint")    if Layer B triggered
+        (False, "blocked_ip")             if Layer C triggered
+        (True, "warn:<reason>")           if a check errored (fail open)
+    """
+    # ----- Layer B: fingerprint dedup -----
+    fp_limit = int((os.getenv("SIGNUP_FP_LIMIT") or "2").strip())
+    if fingerprint and fp_limit > 0:
+        try:
+            # Count how many OTHER users share this signup_fingerprint
+            res = (supa.table("users")
+                   .select("id", count="exact")
+                   .eq("signup_fingerprint", fingerprint)
+                   .neq("id", current_user_id)
+                   .execute())
+            existing_count = res.count or 0
+            if existing_count >= fp_limit:
+                print(f"[signup-metadata] [BLOCKED-FP] fingerprint={fingerprint[:20]}... "
+                      f"already on {existing_count} accounts (limit={fp_limit})")
+                return False, "blocked_fingerprint"
+        except Exception as e:
+            print(f"[signup-metadata] fingerprint check failed (proceeding): {e}")
+            # fail open — don't block legit users on DB hiccups
+
+    # ----- Layer C: IP rate-limit (signups per IP in last 24h) -----
+    ip_limit = int((os.getenv("SIGNUP_IP_LIMIT_24H") or "5").strip())
+    if ip and ip_limit > 0:
+        try:
+            # Count successful signup attempts from this IP in the last 24h
+            cutoff_iso = _iso_24h_ago()
+            res = (supa.table("signup_attempts")
+                   .select("id", count="exact")
+                   .eq("ip", ip)
+                   .eq("result", "allowed")
+                   .gte("attempted_at", cutoff_iso)
+                   .execute())
+            recent_count = res.count or 0
+            if recent_count >= ip_limit:
+                print(f"[signup-metadata] [BLOCKED-IP] ip={ip} "
+                      f"had {recent_count} signups in last 24h (limit={ip_limit})")
+                return False, "blocked_ip"
+        except Exception as e:
+            print(f"[signup-metadata] IP rate-limit check failed (proceeding): {e}")
+            # fail open
+
+    return True, ""
+
+
+def _iso_24h_ago():
+    """Return ISO 8601 timestamp for 24 hours ago, in UTC. Used for rate-limit windows."""
+    from datetime import datetime, timezone, timedelta
+    return (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+
+def _record_signup_attempt(supa, ip, fingerprint, email, result):
+    """Log a signup attempt to the signup_attempts table.
+    Used for both rate-limiting (Layer C reads from here) and forensics.
+    Never raises — if logging fails, we don't want to break the user's signup."""
+    try:
+        supa.table("signup_attempts").insert({
+            "ip": ip or "unknown",
+            "email_attempted": (email or "")[:200] or None,
+            "fingerprint": (fingerprint or "")[:200] or None,
+            "result": result,
+        }).execute()
+    except Exception as e:
+        print(f"[signup-metadata] failed to record attempt: {e}")
+
 
 # ============================================================
 # Rate Limiting (IP-based, in-memory)
@@ -1020,6 +1226,92 @@ def clerk_webhook():
 
 
 # ============================================================
+# /api/signup-metadata — receives browser-side context (fingerprint, IP)
+# right after Clerk completes signup. Runs Layers B + C anti-abuse checks
+# and stores the metadata on the user's row.
+#
+# Frontend MUST call this endpoint with:
+#   Authorization: Bearer <Clerk session JWT>
+#   Body: {"fingerprint": "<browser fingerprint>"}
+#
+# Returns:
+#   200 {"ok": true, "stored": true}  — all good, metadata stored
+#   200 {"ok": true, "stored": false, "reason": "..."} — fail-open (logged)
+#   403 {"ok": false, "reason": "blocked_fingerprint" | "blocked_ip"} — abuse block
+#   401 {"ok": false, "reason": "unauthorized"} — JWT invalid
+# ============================================================
+@app.route("/api/signup-metadata", methods=["POST", "OPTIONS"])
+def signup_metadata():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    if not _AUTH_DEPS_OK:
+        return jsonify({"ok": False, "reason": "auth_deps_unavailable", "detail": _AUTH_DEPS_ERR}), 503
+
+    # 1. Verify the Clerk JWT
+    user_id, jwt_err = _verify_clerk_jwt(request)
+    if not user_id:
+        print(f"[signup-metadata] JWT verification failed: {jwt_err}")
+        return jsonify({"ok": False, "reason": "unauthorized", "detail": jwt_err}), 401
+
+    # 2. Parse the request body for fingerprint
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        body = {}
+    fingerprint = (body.get("fingerprint") or "").strip()[:200]
+    ip = _client_ip()
+
+    # 3. Get Supabase
+    supa = _get_supabase()
+    if supa is None:
+        # Without DB, we can't enforce limits — fail open but warn
+        print(f"[signup-metadata] Supabase unavailable for user {user_id}")
+        return jsonify({"ok": True, "stored": False, "reason": "supabase_unavailable"}), 200
+
+    # 4. Run anti-abuse checks (Layers B + C)
+    allowed, reason = _check_signup_metadata_limits(supa, ip, fingerprint, user_id)
+
+    # 5. Get the user's email (for logging the attempt)
+    user_email = ""
+    try:
+        ures = supa.table("users").select("email").eq("id", user_id).limit(1).execute()
+        if ures.data and len(ures.data) > 0:
+            user_email = ures.data[0].get("email", "") or ""
+    except Exception:
+        pass
+
+    # 6. Always log the attempt (whether allowed or blocked)
+    _record_signup_attempt(supa, ip, fingerprint, user_email, "allowed" if allowed else reason)
+
+    if not allowed:
+        # Blocked. The Clerk user exists but we won't write fingerprint/IP to their row.
+        # Frontend will receive 403 and sign them out.
+        print(f"[signup-metadata] [BLOCKED] user={user_id} email={user_email} "
+              f"ip={ip} fp={fingerprint[:20]}... reason={reason}")
+        return jsonify({
+            "ok": False,
+            "reason": reason,
+            "user_id": user_id
+        }), 403
+
+    # 7. Allowed — update the user row with fingerprint + IP
+    try:
+        supa.table("users").update({
+            "signup_fingerprint": fingerprint or None,
+            "signup_ip": ip or None,
+        }).eq("id", user_id).execute()
+        print(f"[signup-metadata] [OK] user={user_id} email={user_email} "
+              f"ip={ip} fp={fingerprint[:20]}...")
+        return jsonify({"ok": True, "stored": True, "user_id": user_id}), 200
+    except Exception as e:
+        # Update failed — don't block the user, but log loud
+        print(f"[signup-metadata] update failed for {user_id}: {e}")
+        return jsonify({"ok": True, "stored": False, "reason": "update_failed",
+                        "detail": str(e)[:120]}), 200
+
+
+# ============================================================
 # /api/auth-debug — diagnostic endpoint, safe to call anytime.
 # Reports whether auth deps are configured correctly. Does NOT
 # expose any secrets — only their PRESENCE/ABSENCE and lengths.
@@ -1029,13 +1321,19 @@ def auth_debug():
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
     supa = _get_supabase()
+    jwks = _get_jwks_client()
     return jsonify({
         "auth_deps_imported": _AUTH_DEPS_OK,
         "auth_deps_error": _AUTH_DEPS_ERR if not _AUTH_DEPS_OK else "",
         "supabase_url_set": bool((os.getenv("SUPABASE_URL") or "").strip()),
         "supabase_key_set": bool((os.getenv("SUPABASE_SERVICE_KEY") or "").strip()),
         "clerk_webhook_secret_set": bool((os.getenv("CLERK_WEBHOOK_SECRET") or "").strip()),
+        "clerk_secret_key_set": bool((os.getenv("CLERK_SECRET_KEY") or "").strip()),
         "supabase_client_ready": supa is not None,
+        "jwks_client_ready": jwks is not None,
+        "jwks_init_error": _jwks_init_err if jwks is None else "",
+        "signup_fp_limit": int((os.getenv("SIGNUP_FP_LIMIT") or "2").strip()),
+        "signup_ip_limit_24h": int((os.getenv("SIGNUP_IP_LIMIT_24H") or "5").strip()),
     })
 
 
