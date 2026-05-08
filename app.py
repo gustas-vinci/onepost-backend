@@ -303,6 +303,188 @@ def _record_signup_attempt(supa, ip, fingerprint, email, result):
 
 
 # ============================================================
+# AUTHENTICATED USER QUOTA SYSTEM (Supabase-backed)
+# ============================================================
+# These helpers manage daily_used + bonus_credits for signed-in users.
+# Anonymous users continue to use the existing Apps Script flow — these
+# are NOT called for them.
+#
+# Quota model:
+#   - daily_used: how many of today's 3 daily slots have been used
+#   - bonus_credits: persistent, granted on signup (default 2), consumed
+#                    AFTER daily is exhausted. Never refills.
+#   - daily_reset_at: date column. When it's < today, we reset daily_used = 0
+#
+# Consumption order: daily first, then bonus. Always.
+# ============================================================
+USER_DAILY_LIMIT = 3  # mirror of frontend DAILY_CAP
+
+def _today_iso():
+    """Today's date in YYYY-MM-DD format (UTC). Used for daily_reset_at comparisons."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _get_user_quota(supa, user_id):
+    """Read current quota state for an authenticated user. Lazy-resets daily counter
+    if it's a new day since last reset.
+
+    Returns dict:
+        {
+          "ok": bool,
+          "user_id": str,
+          "daily_used": int,
+          "daily_limit": int,
+          "bonus_credits": int,
+          "daily_remaining": int,    # max(0, daily_limit - daily_used)
+          "total_remaining": int,    # daily_remaining + bonus_credits
+          "allowed": bool,           # total_remaining > 0
+          "reason": str              # 'ok' | 'no_user' | 'db_error'
+        }
+
+    Never raises. On DB error, returns ok=False with reason set.
+    """
+    try:
+        res = (supa.table("users")
+               .select("id, daily_used, bonus_credits, daily_reset_at")
+               .eq("id", user_id)
+               .limit(1)
+               .execute())
+        if not res.data or len(res.data) == 0:
+            # User authenticated via JWT but no Supabase row — webhook may not have
+            # synced yet. Treat as anonymous-quota-equivalent (allow but warn).
+            return {
+                "ok": False, "user_id": user_id,
+                "daily_used": 0, "daily_limit": USER_DAILY_LIMIT,
+                "bonus_credits": 0, "daily_remaining": USER_DAILY_LIMIT,
+                "total_remaining": USER_DAILY_LIMIT, "allowed": True,
+                "reason": "no_user_row"
+            }
+        row = res.data[0]
+        daily_used = int(row.get("daily_used") or 0)
+        bonus_credits = int(row.get("bonus_credits") or 0)
+        reset_at = row.get("daily_reset_at") or ""
+
+        # Lazy reset: if last reset date < today, reset daily_used to 0
+        today = _today_iso()
+        if reset_at < today:
+            try:
+                supa.table("users").update({
+                    "daily_used": 0,
+                    "daily_reset_at": today,
+                }).eq("id", user_id).execute()
+                daily_used = 0
+                print(f"[quota] daily reset for user {user_id} (was {row.get('daily_reset_at')}, now {today})")
+            except Exception as e:
+                print(f"[quota] daily reset failed for {user_id} (proceeding with old value): {e}")
+
+        daily_remaining = max(0, USER_DAILY_LIMIT - daily_used)
+        total_remaining = daily_remaining + bonus_credits
+        return {
+            "ok": True, "user_id": user_id,
+            "daily_used": daily_used, "daily_limit": USER_DAILY_LIMIT,
+            "bonus_credits": bonus_credits,
+            "daily_remaining": daily_remaining,
+            "total_remaining": total_remaining,
+            "allowed": total_remaining > 0,
+            "reason": "ok"
+        }
+    except Exception as e:
+        print(f"[quota] _get_user_quota error for {user_id}: {e}")
+        return {
+            "ok": False, "user_id": user_id,
+            "daily_used": 0, "daily_limit": USER_DAILY_LIMIT,
+            "bonus_credits": 0, "daily_remaining": USER_DAILY_LIMIT,
+            "total_remaining": USER_DAILY_LIMIT, "allowed": True,
+            "reason": f"db_error: {str(e)[:80]}"
+        }
+
+
+def _consume_user_quota(supa, user_id):
+    """Decrement quota for an authenticated user.
+    Daily is consumed first; once exhausted, bonus credits are consumed.
+
+    Returns dict:
+        {
+          "ok": bool,
+          "consumed_from": "daily" | "bonus" | "none",
+          "daily_used": int,
+          "bonus_credits": int,
+          "remaining_after": int,
+          "reason": str
+        }
+
+    Never raises.
+    """
+    # First, get current state (with lazy reset applied)
+    state = _get_user_quota(supa, user_id)
+    if not state["ok"]:
+        return {
+            "ok": False, "consumed_from": "none",
+            "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
+            "remaining_after": state["total_remaining"],
+            "reason": state["reason"]
+        }
+
+    if state["total_remaining"] <= 0:
+        return {
+            "ok": False, "consumed_from": "none",
+            "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
+            "remaining_after": 0, "reason": "exhausted"
+        }
+
+    # Consume from daily first if available
+    new_daily = state["daily_used"]
+    new_bonus = state["bonus_credits"]
+    consumed_from = ""
+    if state["daily_remaining"] > 0:
+        new_daily = state["daily_used"] + 1
+        consumed_from = "daily"
+    elif state["bonus_credits"] > 0:
+        new_bonus = state["bonus_credits"] - 1
+        consumed_from = "bonus"
+    else:
+        # Should not reach here (total_remaining > 0 above), but defensive
+        return {
+            "ok": False, "consumed_from": "none",
+            "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
+            "remaining_after": 0, "reason": "exhausted_unexpected"
+        }
+
+    # Write the new state
+    try:
+        supa.table("users").update({
+            "daily_used": new_daily,
+            "bonus_credits": new_bonus,
+        }).eq("id", user_id).execute()
+    except Exception as e:
+        print(f"[quota] _consume_user_quota update failed for {user_id}: {e}")
+        return {
+            "ok": False, "consumed_from": "none",
+            "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
+            "remaining_after": state["total_remaining"],
+            "reason": f"update_failed: {str(e)[:80]}"
+        }
+
+    # Best-effort log to usage_logs (non-blocking — don't fail consumption if log fails)
+    try:
+        supa.table("usage_logs").insert({
+            "user_id": user_id,
+            "source": consumed_from,
+        }).execute()
+    except Exception as e:
+        print(f"[quota] usage_log insert failed (non-blocking): {e}")
+
+    new_daily_remaining = max(0, USER_DAILY_LIMIT - new_daily)
+    new_total = new_daily_remaining + new_bonus
+    return {
+        "ok": True, "consumed_from": consumed_from,
+        "daily_used": new_daily, "bonus_credits": new_bonus,
+        "remaining_after": new_total, "reason": "ok"
+    }
+
+
+# ============================================================
 # Rate Limiting (IP-based, in-memory)
 # ============================================================
 # REGEN_LIMIT regenerations per IP within REGEN_WINDOW_SEC.
@@ -810,8 +992,14 @@ def _call_quota_script(action, email, fingerprint, ip, timeout=10):
 
 @app.route("/check-quota", methods=["POST", "OPTIONS"])
 def check_quota():
-    """Check if user has remaining generations for the day.
-    Identifies user by email AND fingerprint AND IP — match on ANY = quota counts."""
+    """Check if user has remaining generations.
+
+    BRANCH:
+      - Authenticated (valid Clerk JWT in Authorization header):
+          → reads from Supabase (daily_used + bonus_credits)
+      - Anonymous (no/invalid JWT):
+          → existing flow via Apps Script keyed by email/fingerprint/IP
+    """
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
     try:
@@ -820,13 +1008,41 @@ def check_quota():
         fingerprint = (data.get("fingerprint") or "").strip()
         ip = _client_ip()
 
+        # Branch on auth: try JWT verification (silent on failure → anonymous flow)
+        user_id = None
+        if _AUTH_DEPS_OK:
+            user_id, _jwt_err = _verify_clerk_jwt(request)
+
+        if user_id:
+            # AUTHENTICATED PATH — use Supabase
+            supa = _get_supabase()
+            if supa is None:
+                # Supabase down — fall back to anonymous flow rather than block user
+                print(f"[check-quota] supabase unavailable for user {user_id} — falling back to anon flow")
+            else:
+                state = _get_user_quota(supa, user_id)
+                return jsonify({
+                    "success": True,
+                    "auth": "user",   # tells frontend this came from authenticated path
+                    "allowed": bool(state["allowed"]),
+                    "used": state["daily_used"],
+                    "remaining": state["total_remaining"],     # daily + bonus
+                    "limit": state["daily_limit"],
+                    "daily_used": state["daily_used"],
+                    "daily_remaining": state["daily_remaining"],
+                    "bonus_credits": state["bonus_credits"],
+                    "retry_after_seconds": 0,
+                    "retry_after_human": "",
+                    "note": state["reason"],
+                })
+
+        # ANONYMOUS PATH — existing Apps Script flow (UNCHANGED)
         result = _call_quota_script("check_quota", email, fingerprint, ip, timeout=10)
-        # Surface the result to frontend
         retry_after = int(result.get("retry_after_seconds") or 0)
-        # Surface Apps Script error if present (for debugging visibility)
         upstream_error = result.get("error", "") if not result.get("ok", True) else ""
         return jsonify({
             "success": True,
+            "auth": "anon",
             "allowed": bool(result.get("allowed", True)),
             "used": int(result.get("used", 0)),
             "remaining": int(result.get("remaining", 3)),
@@ -838,7 +1054,7 @@ def check_quota():
     except Exception as e:
         print(f"[check-quota] Unexpected error: {e}")
         # Fail open on unexpected errors
-        return jsonify({"success": True, "allowed": True, "used": 0,
+        return jsonify({"success": True, "auth": "anon", "allowed": True, "used": 0,
                         "remaining": 3, "limit": 3, "retry_after_seconds": 0,
                         "retry_after_human": "", "note": f"backend_error: {str(e)[:80]}"})
 
@@ -846,7 +1062,12 @@ def check_quota():
 @app.route("/record-generation", methods=["POST", "OPTIONS"])
 def record_generation():
     """Record a successful generation against this user's quota.
-    Called by frontend AFTER /generate succeeds."""
+    Called by frontend AFTER /generate succeeds.
+
+    BRANCH:
+      - Authenticated: decrement Supabase (daily first, then bonus)
+      - Anonymous: existing Apps Script flow
+    """
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
     try:
@@ -855,18 +1076,44 @@ def record_generation():
         fingerprint = (data.get("fingerprint") or "").strip()
         ip = _client_ip()
 
+        # Branch on auth: try JWT first, fall back to anonymous
+        user_id = None
+        if _AUTH_DEPS_OK:
+            user_id, _jwt_err = _verify_clerk_jwt(request)
+
+        if user_id:
+            # AUTHENTICATED PATH — consume from Supabase
+            supa = _get_supabase()
+            if supa is None:
+                # Supabase down — fall back to anonymous flow rather than block user
+                print(f"[record-generation] supabase unavailable for user {user_id} — falling back to anon flow")
+            else:
+                result = _consume_user_quota(supa, user_id)
+                return jsonify({
+                    "success": True,
+                    "auth": "user",
+                    "recorded": bool(result.get("ok", False)),
+                    "consumed_from": result.get("consumed_from", "none"),
+                    "daily_used": result.get("daily_used", 0),
+                    "bonus_credits": result.get("bonus_credits", 0),
+                    "remaining": result.get("remaining_after", 0),
+                    "note": result.get("reason", ""),
+                })
+
+        # ANONYMOUS PATH — existing Apps Script flow (UNCHANGED)
         result = _call_quota_script("record_generation", email, fingerprint, ip, timeout=10)
-        # Surface Apps Script error if present (so frontend debug overlay shows it)
         upstream_error = result.get("error", "") if not result.get("ok", True) else ""
         return jsonify({
             "success": True,
+            "auth": "anon",
             "recorded": bool(result.get("recorded", False)),
             "row": result.get("row", 0),
             "note": result.get("_note", "") or upstream_error
         })
     except Exception as e:
         print(f"[record-generation] Unexpected error: {e}")
-        return jsonify({"success": True, "recorded": False, "note": f"backend_error: {str(e)[:80]}"})
+        return jsonify({"success": True, "auth": "anon", "recorded": False,
+                        "note": f"backend_error: {str(e)[:80]}"})
 
 
 # ============================================================
