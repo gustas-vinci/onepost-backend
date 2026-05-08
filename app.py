@@ -54,6 +54,48 @@ def _get_supabase():
         print(f"[supabase] init failed: {e}")
         return None
 
+
+# ============================================================
+# ANTI-ABUSE — Email normalization (Layer A: catches Tier 2 abuse)
+# ============================================================
+# Gmail and Googlemail treat dots and +aliases as identical:
+#   yourname@gmail.com == your.name@gmail.com == yourname+anything@gmail.com
+# All deliver to the same inbox. Anyone abusing free tier can rotate
+# these forever without "creating" new accounts. We normalize all
+# Gmail-family addresses to a canonical form and dedupe against it.
+# ============================================================
+_GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
+
+def _normalize_email(email):
+    """Return canonical form of an email for dedup purposes.
+    For Gmail/Googlemail: strip dots from local part AND strip +aliases.
+    For all other domains: lowercase only (no dot/alias normalization,
+    because other providers treat foo@x.com and f.oo@x.com as different).
+
+    Examples:
+      'YourName@gmail.com'         → 'yourname@gmail.com'
+      'your.name@gmail.com'        → 'yourname@gmail.com'
+      'yourname+abuse1@gmail.com'  → 'yourname@gmail.com'
+      'y.our.name+x@googlemail.com'→ 'yourname@gmail.com'
+      'foo+bar@outlook.com'        → 'foo+bar@outlook.com' (unchanged — not Gmail)
+
+    Returns lowercased input on any error (defensive, never raises).
+    """
+    try:
+        if not email or "@" not in email:
+            return (email or "").lower().strip()
+        local, _, domain = email.lower().strip().partition("@")
+        if domain in _GMAIL_DOMAINS:
+            # Strip everything from + onwards (alias)
+            local = local.split("+", 1)[0]
+            # Strip all dots
+            local = local.replace(".", "")
+            # Always normalize the domain to gmail.com (treat googlemail same)
+            return f"{local}@gmail.com"
+        return f"{local}@{domain}"
+    except Exception:
+        return (email or "").lower().strip()
+
 # ============================================================
 # Rate Limiting (IP-based, in-memory)
 # ============================================================
@@ -896,18 +938,49 @@ def clerk_webhook():
     # Step 6 — handle the event (idempotent operations)
     try:
         if event_type == "user.created":
+            # ---- ANTI-ABUSE Layer A: Gmail normalization + dedup ----
+            # Normalize email to its canonical form (strip Gmail dots/aliases).
+            # Then check if any existing user has the same normalized_email.
+            # If yes → this is a Tier 2 abuse attempt (alias trick). Block it.
+            normalized = _normalize_email(email) if email else ""
+            if normalized:
+                try:
+                    existing = supa.table("users").select("id").eq("normalized_email", normalized).limit(1).execute()
+                    if existing.data and len(existing.data) > 0 and existing.data[0]["id"] != clerk_user_id:
+                        # Duplicate normalized email belongs to a DIFFERENT Clerk user.
+                        # The fresh signup is an abuse attempt. We:
+                        #   1. Don't insert a row in our DB
+                        #   2. Return 200 so Clerk doesn't retry
+                        #   3. Log it loud so we can see it in Render logs
+                        # The orphaned Clerk account (without our row) won't get bonus credits
+                        # or any quota perks. Future cleanup task: delete it via Clerk API.
+                        existing_id = existing.data[0]["id"]
+                        print(f"[clerk-webhook] [BLOCKED-ALIAS] new user {clerk_user_id} ({email}) "
+                              f"normalized to '{normalized}' which already belongs to {existing_id}")
+                        return jsonify({
+                            "ok": True,
+                            "blocked": True,
+                            "reason": "duplicate_normalized_email",
+                            "user_id": clerk_user_id
+                        }), 200
+                except Exception as dedup_err:
+                    # Dedup check failed for some non-blocking reason — log but proceed
+                    # with insert (fail open: don't block legit users due to DB hiccups).
+                    print(f"[clerk-webhook] dedup check failed (proceeding anyway): {dedup_err}")
+
             # Idempotent insert: if row already exists, this raises a duplicate key error
             # which we catch and treat as success (Clerk sometimes resends events)
             row = {
                 "id": clerk_user_id,
                 "email": email or f"{clerk_user_id}@unknown.local",  # email is required (UNIQUE NOT NULL)
+                "normalized_email": normalized or None,
                 "name": name or None,
                 "bonus_credits": 2,
                 "daily_used": 0,
             }
             try:
                 supa.table("users").insert(row).execute()
-                print(f"[clerk-webhook] inserted user {clerk_user_id} ({email})")
+                print(f"[clerk-webhook] inserted user {clerk_user_id} ({email}) norm='{normalized}'")
             except Exception as ins_err:
                 err_str = str(ins_err)
                 # Detect duplicate-key (idempotent retry) vs real error
@@ -921,6 +994,8 @@ def clerk_webhook():
             update_fields = {}
             if email:
                 update_fields["email"] = email
+                # Keep normalized_email in sync when email changes
+                update_fields["normalized_email"] = _normalize_email(email)
             if name:
                 update_fields["name"] = name
             if update_fields:
