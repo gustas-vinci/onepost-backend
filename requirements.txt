@@ -1,8 +1,15 @@
-Flask>=3.0.0
+# OnePost Backend Dependencies
+# Existing libraries (already deployed)
+flask>=3.0.0
 flask-cors>=4.0.0
 requests>=2.31.0
 python-dotenv>=1.0.0
-gunicorn>=22.0.0
-opencv-python-headless>=4.10.0
-numpy>=1.26.0
 
+# Day 2 — new for Clerk webhook + Supabase
+# svix: official lib for verifying Clerk webhook signatures
+svix>=1.30.0
+# supabase-py: official Supabase client for Python
+supabase>=2.5.0
+
+# Production server (Render uses this)
+gunicorn>=21.2.0
