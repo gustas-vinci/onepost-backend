@@ -1516,7 +1516,38 @@ def signup_metadata():
         print(f"[signup-metadata] Supabase unavailable for user {user_id}")
         return jsonify({"ok": True, "stored": False, "reason": "supabase_unavailable"}), 200
 
-    # 4. Run anti-abuse checks (Layers B + C)
+    # 3.5 — IDEMPOTENCY CHECK: if user already has metadata recorded, this is a
+    # returning sign-IN, not a fresh sign-UP. Skip abuse checks entirely.
+    # This is the bugfix from Day 3 Step 6 — without this, every sign-in by a
+    # returning user counts against the IP rate-limit, locking out real users.
+    try:
+        existing = (supa.table("users")
+                    .select("signup_fingerprint, signup_ip, email")
+                    .eq("id", user_id)
+                    .limit(1)
+                    .execute())
+        if existing.data and len(existing.data) > 0:
+            existing_fp = (existing.data[0].get("signup_fingerprint") or "").strip()
+            existing_ip = (existing.data[0].get("signup_ip") or "").strip()
+            existing_email = (existing.data[0].get("email") or "").strip()
+            if existing_fp or existing_ip:
+                # User has been through metadata sync before — they're a returning sign-in.
+                # Don't run abuse checks (they'd unfairly block returning users).
+                # Don't record to signup_attempts (it's not a signup attempt).
+                print(f"[signup-metadata] [RETURNING] user={user_id} email={existing_email} "
+                      f"already has metadata, skipping abuse checks")
+                return jsonify({
+                    "ok": True,
+                    "stored": False,  # nothing new written
+                    "returning": True,
+                    "reason": "already_synced",
+                    "user_id": user_id
+                }), 200
+    except Exception as e:
+        # Idempotency check failed — proceed with abuse checks (safe fallback)
+        print(f"[signup-metadata] idempotency check failed (proceeding): {e}")
+
+    # 4. Run anti-abuse checks (Layers B + C) — only reached for FRESH signups
     allowed, reason = _check_signup_metadata_limits(supa, ip, fingerprint, user_id)
 
     # 5. Get the user's email (for logging the attempt)
@@ -1528,7 +1559,7 @@ def signup_metadata():
     except Exception:
         pass
 
-    # 6. Always log the attempt (whether allowed or blocked)
+    # 6. Log the attempt (only for fresh signups now)
     _record_signup_attempt(supa, ip, fingerprint, user_email, "allowed" if allowed else reason)
 
     if not allowed:
