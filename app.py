@@ -317,7 +317,32 @@ def _record_signup_attempt(supa, ip, fingerprint, email, result):
 #
 # Consumption order: daily first, then bonus. Always.
 # ============================================================
-USER_DAILY_LIMIT = 3  # mirror of frontend DAILY_CAP
+USER_DAILY_LIMIT = 3  # mirror of frontend DAILY_CAP — free tier daily quota
+
+
+# ============================================================
+# TIER LIMITS — single source of truth for free + paid tiers
+# ============================================================
+# Free uses daily quota (3/day) + bonus credits (2 lifetime, granted on signup).
+# Paid tiers use monthly quota only — bonus_credits ignored, daily_used ignored.
+# Adding a tier later = update this function + nothing else.
+# ============================================================
+def _get_tier_limits(tier):
+    """Return quota limits for a given tier.
+    Returns dict: {kind: 'daily'|'monthly', daily, monthly, bonus_eligible}
+    Falls back to free for unknown tier strings (defensive)."""
+    t = (tier or "free").strip().lower()
+    if t == "free":
+        return {"kind": "daily", "daily": USER_DAILY_LIMIT, "monthly": None, "bonus_eligible": True}
+    if t == "creator":
+        return {"kind": "monthly", "daily": None, "monthly": 60, "bonus_eligible": False}
+    if t == "pro":
+        return {"kind": "monthly", "daily": None, "monthly": 100, "bonus_eligible": False}
+    if t == "agency":
+        return {"kind": "monthly", "daily": None, "monthly": 500, "bonus_eligible": False}
+    print(f"[tier] unknown tier '{tier}' — falling back to free")
+    return {"kind": "daily", "daily": USER_DAILY_LIMIT, "monthly": None, "bonus_eligible": True}
+
 
 def _today_iso():
     """Today's date in YYYY-MM-DD format (UTC). Used for daily_reset_at comparisons."""
@@ -325,28 +350,84 @@ def _today_iso():
     return datetime.now(timezone.utc).date().isoformat()
 
 
-def _get_user_quota(supa, user_id):
-    """Read current quota state for an authenticated user. Lazy-resets daily counter
-    if it's a new day since last reset.
+def _now_utc():
+    """Current UTC datetime — used for period-end comparisons."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
 
-    Returns dict:
+
+def _is_period_active(current_period_end_str):
+    """Check if a paid user's current billing period is still active.
+
+    Returns True if period_end is in the future, False if expired or unset.
+    Handles ISO strings (with or without 'Z' suffix), None, and garbage gracefully.
+
+    Used as a defense-in-depth safety net: if a paid user's period has expired
+    AND the webhook hasn't fired yet (Razorpay delay, Render asleep), the backend
+    treats them as free for that request rather than serving infinite paid quota.
+    """
+    if not current_period_end_str:
+        return False
+    try:
+        from datetime import datetime, timezone
+        s = current_period_end_str
+        if isinstance(s, str):
+            # Supabase timestamptz can come back with 'Z' or '+00:00' — normalize
+            s = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+        else:
+            dt = s
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt > _now_utc()
+    except Exception as e:
+        print(f"[tier] _is_period_active parse failed for {current_period_end_str}: {e}")
+        return False
+
+
+def _quota_fallback(user_id, reason):
+    """Safe-defaults response when DB read fails. Fails open (allows generation)
+    but with no quota tracking. Used as a safety net by _get_user_quota."""
+    return {
+        "ok": False, "user_id": user_id,
+        "tier": "free", "kind": "daily",
+        "daily_used": 0, "daily_limit": USER_DAILY_LIMIT,
+        "bonus_credits": 0, "daily_remaining": USER_DAILY_LIMIT,
+        "monthly_used": 0, "monthly_limit": 0, "monthly_remaining": 0,
+        "current_period_end": "",
+        "total_remaining": USER_DAILY_LIMIT, "allowed": True,
+        "reason": reason
+    }
+
+
+def _get_user_quota(supa, user_id):
+    """Read current quota state for an authenticated user.
+
+    Branches on tier:
+      - free: daily counter + bonus credits (existing behavior, unchanged)
+      - creator/pro/agency: monthly counter, with period-end safety net
+
+    Returns dict (extended for paid tiers; free shape preserves all old keys):
         {
           "ok": bool,
           "user_id": str,
-          "daily_used": int,
-          "daily_limit": int,
-          "bonus_credits": int,
-          "daily_remaining": int,    # max(0, daily_limit - daily_used)
-          "total_remaining": int,    # daily_remaining + bonus_credits
-          "allowed": bool,           # total_remaining > 0
-          "reason": str              # 'ok' | 'no_user' | 'db_error'
+          "tier": str,                  # 'free' | 'creator' | 'pro' | 'agency'
+          "kind": str,                  # 'daily' | 'monthly'
+          # Free-tier fields (zeroed for paid):
+          "daily_used": int, "daily_limit": int, "bonus_credits": int, "daily_remaining": int,
+          # Paid-tier fields (zeroed for free):
+          "monthly_used": int, "monthly_limit": int, "monthly_remaining": int,
+          "current_period_end": str,
+          # Common:
+          "total_remaining": int, "allowed": bool, "reason": str
         }
 
     Never raises. On DB error, returns ok=False with reason set.
     """
     try:
         res = (supa.table("users")
-               .select("id, daily_used, bonus_credits, daily_reset_at")
+               .select("id, tier, daily_used, bonus_credits, daily_reset_at, "
+                       "monthly_used, current_period_end, subscription_status")
                .eq("id", user_id)
                .limit(1)
                .execute())
@@ -362,7 +443,8 @@ def _get_user_quota(supa, user_id):
             if created:
                 # Re-query to get the fresh row
                 res = (supa.table("users")
-                       .select("id, daily_used, bonus_credits, daily_reset_at")
+                       .select("id, tier, daily_used, bonus_credits, daily_reset_at, "
+                               "monthly_used, current_period_end, subscription_status")
                        .eq("id", user_id)
                        .limit(1)
                        .execute())
@@ -372,62 +454,89 @@ def _get_user_quota(supa, user_id):
                 else:
                     # Lazy creation reported success but row not findable — odd
                     print(f"[quota] lazy creation reported OK but row not found for {user_id}")
-                    return {
-                        "ok": False, "user_id": user_id,
-                        "daily_used": 0, "daily_limit": USER_DAILY_LIMIT,
-                        "bonus_credits": 0, "daily_remaining": USER_DAILY_LIMIT,
-                        "total_remaining": USER_DAILY_LIMIT, "allowed": True,
-                        "reason": "lazy_create_inconsistent"
-                    }
+                    return _quota_fallback(user_id, "lazy_create_inconsistent")
             else:
                 # Lazy creation failed (Clerk API down, abuse block, etc.)
                 # Fall back to old behavior: allow but warn.
                 print(f"[quota] lazy creation failed for {user_id}, falling back to no-tracking")
-                return {
-                    "ok": False, "user_id": user_id,
-                    "daily_used": 0, "daily_limit": USER_DAILY_LIMIT,
-                    "bonus_credits": 0, "daily_remaining": USER_DAILY_LIMIT,
-                    "total_remaining": USER_DAILY_LIMIT, "allowed": True,
-                    "reason": "no_user_row_lazy_failed"
-                }
+                return _quota_fallback(user_id, "no_user_row_lazy_failed")
         row = res.data[0]
-        daily_used = int(row.get("daily_used") or 0)
-        bonus_credits = int(row.get("bonus_credits") or 0)
-        reset_at = row.get("daily_reset_at") or ""
+        tier = (row.get("tier") or "free").strip().lower()
+        limits = _get_tier_limits(tier)
 
-        # Lazy reset: if last reset date < today, reset daily_used to 0
-        today = _today_iso()
-        if reset_at < today:
-            try:
-                supa.table("users").update({
-                    "daily_used": 0,
-                    "daily_reset_at": today,
-                }).eq("id", user_id).execute()
-                daily_used = 0
-                print(f"[quota] daily reset for user {user_id} (was {row.get('daily_reset_at')}, now {today})")
-            except Exception as e:
-                print(f"[quota] daily reset failed for {user_id} (proceeding with old value): {e}")
+        # ---- Period-end safety net (defense-in-depth for paid tiers) ----
+        # If user is paid but their period has expired AND webhook hasn't downgraded
+        # them yet, treat as free for THIS request. The next webhook will normalize
+        # the DB. Prevents stale-paid users from getting infinite quota if
+        # subscription.completed event was delayed or lost.
+        if limits["kind"] == "monthly":
+            period_end = row.get("current_period_end")
+            if not _is_period_active(period_end):
+                print(f"[quota] [PERIOD-EXPIRED] user={user_id} tier={tier} "
+                      f"period_end={period_end} — treating as free for this request")
+                # Force free for THIS calculation only — don't write to DB.
+                # The webhook is the authoritative source of truth for tier state.
+                tier = "free"
+                limits = _get_tier_limits(tier)
 
-        daily_remaining = max(0, USER_DAILY_LIMIT - daily_used)
-        total_remaining = daily_remaining + bonus_credits
-        return {
-            "ok": True, "user_id": user_id,
-            "daily_used": daily_used, "daily_limit": USER_DAILY_LIMIT,
-            "bonus_credits": bonus_credits,
-            "daily_remaining": daily_remaining,
-            "total_remaining": total_remaining,
-            "allowed": total_remaining > 0,
-            "reason": "ok"
-        }
+        # ---- Branch on tier kind ----
+        if limits["kind"] == "daily":
+            # FREE TIER PATH — preserves existing behavior exactly
+            daily_used = int(row.get("daily_used") or 0)
+            bonus_credits = int(row.get("bonus_credits") or 0)
+            reset_at = row.get("daily_reset_at") or ""
+
+            # Lazy reset: if last reset date < today, reset daily_used to 0
+            today = _today_iso()
+            if reset_at < today:
+                try:
+                    supa.table("users").update({
+                        "daily_used": 0,
+                        "daily_reset_at": today,
+                    }).eq("id", user_id).execute()
+                    daily_used = 0
+                    print(f"[quota] daily reset for user {user_id} (was {row.get('daily_reset_at')}, now {today})")
+                except Exception as e:
+                    print(f"[quota] daily reset failed for {user_id} (proceeding with old value): {e}")
+
+            daily_remaining = max(0, limits["daily"] - daily_used)
+            total_remaining = daily_remaining + bonus_credits
+            return {
+                "ok": True, "user_id": user_id,
+                "tier": "free", "kind": "daily",
+                "daily_used": daily_used, "daily_limit": limits["daily"],
+                "bonus_credits": bonus_credits,
+                "daily_remaining": daily_remaining,
+                "monthly_used": 0, "monthly_limit": 0, "monthly_remaining": 0,
+                "current_period_end": "",
+                "total_remaining": total_remaining,
+                "allowed": total_remaining > 0,
+                "reason": "ok"
+            }
+        else:
+            # PAID TIER PATH — monthly counter only
+            monthly_used = int(row.get("monthly_used") or 0)
+            monthly_limit = limits["monthly"]
+            monthly_remaining = max(0, monthly_limit - monthly_used)
+            period_end = row.get("current_period_end") or ""
+            return {
+                "ok": True, "user_id": user_id,
+                "tier": tier, "kind": "monthly",
+                # Free-tier fields zeroed for paid users
+                "daily_used": 0, "daily_limit": 0,
+                "bonus_credits": 0, "daily_remaining": 0,
+                # Paid-tier fields populated
+                "monthly_used": monthly_used,
+                "monthly_limit": monthly_limit,
+                "monthly_remaining": monthly_remaining,
+                "current_period_end": period_end if isinstance(period_end, str) else str(period_end),
+                "total_remaining": monthly_remaining,
+                "allowed": monthly_remaining > 0,
+                "reason": "ok"
+            }
     except Exception as e:
         print(f"[quota] _get_user_quota error for {user_id}: {e}")
-        return {
-            "ok": False, "user_id": user_id,
-            "daily_used": 0, "daily_limit": USER_DAILY_LIMIT,
-            "bonus_credits": 0, "daily_remaining": USER_DAILY_LIMIT,
-            "total_remaining": USER_DAILY_LIMIT, "allowed": True,
-            "reason": f"db_error: {str(e)[:80]}"
-        }
+        return _quota_fallback(user_id, f"db_error: {str(e)[:80]}")
 
 
 # ============================================================
@@ -543,86 +652,133 @@ def _lazy_create_user(supa, user_id):
 
 def _consume_user_quota(supa, user_id):
     """Decrement quota for an authenticated user.
-    Daily is consumed first; once exhausted, bonus credits are consumed.
+
+    Branches on tier:
+      - free: daily-first then bonus (existing behavior, unchanged)
+      - paid: increment monthly_used only
 
     Returns dict:
         {
           "ok": bool,
-          "consumed_from": "daily" | "bonus" | "none",
-          "daily_used": int,
-          "bonus_credits": int,
+          "tier": str,
+          "consumed_from": "daily" | "bonus" | "monthly" | "none",
+          "daily_used": int, "bonus_credits": int, "monthly_used": int,
           "remaining_after": int,
           "reason": str
         }
 
     Never raises.
     """
-    # First, get current state (with lazy reset applied)
+    # Get current state (period-end safety net + lazy reset already applied)
     state = _get_user_quota(supa, user_id)
     if not state["ok"]:
         return {
-            "ok": False, "consumed_from": "none",
+            "ok": False, "tier": state.get("tier", "free"),
+            "consumed_from": "none",
             "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
+            "monthly_used": state.get("monthly_used", 0),
             "remaining_after": state["total_remaining"],
             "reason": state["reason"]
         }
 
     if state["total_remaining"] <= 0:
         return {
-            "ok": False, "consumed_from": "none",
+            "ok": False, "tier": state["tier"],
+            "consumed_from": "none",
             "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
+            "monthly_used": state.get("monthly_used", 0),
             "remaining_after": 0, "reason": "exhausted"
         }
 
-    # Consume from daily first if available
-    new_daily = state["daily_used"]
-    new_bonus = state["bonus_credits"]
-    consumed_from = ""
-    if state["daily_remaining"] > 0:
-        new_daily = state["daily_used"] + 1
-        consumed_from = "daily"
-    elif state["bonus_credits"] > 0:
-        new_bonus = state["bonus_credits"] - 1
-        consumed_from = "bonus"
+    # Branch on tier kind
+    if state["kind"] == "daily":
+        # ---------- FREE TIER ---------- (preserves existing daily-first-then-bonus)
+        new_daily = state["daily_used"]
+        new_bonus = state["bonus_credits"]
+        consumed_from = ""
+        if state["daily_remaining"] > 0:
+            new_daily = state["daily_used"] + 1
+            consumed_from = "daily"
+        elif state["bonus_credits"] > 0:
+            new_bonus = state["bonus_credits"] - 1
+            consumed_from = "bonus"
+        else:
+            # Should not reach here (total_remaining > 0 above), but defensive
+            return {
+                "ok": False, "tier": state["tier"],
+                "consumed_from": "none",
+                "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
+                "monthly_used": 0,
+                "remaining_after": 0, "reason": "exhausted_unexpected"
+            }
+        # Write the new state
+        try:
+            supa.table("users").update({
+                "daily_used": new_daily,
+                "bonus_credits": new_bonus,
+            }).eq("id", user_id).execute()
+        except Exception as e:
+            print(f"[quota] _consume_user_quota (free) update failed for {user_id}: {e}")
+            return {
+                "ok": False, "tier": state["tier"],
+                "consumed_from": "none",
+                "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
+                "monthly_used": 0,
+                "remaining_after": state["total_remaining"],
+                "reason": f"update_failed: {str(e)[:80]}"
+            }
+
+        # Best-effort log to usage_logs (non-blocking — don't fail consumption if log fails)
+        try:
+            supa.table("usage_logs").insert({
+                "user_id": user_id,
+                "source": consumed_from,
+            }).execute()
+        except Exception as e:
+            print(f"[quota] usage_log insert failed (non-blocking): {e}")
+
+        new_daily_remaining = max(0, USER_DAILY_LIMIT - new_daily)
+        new_total = new_daily_remaining + new_bonus
+        return {
+            "ok": True, "tier": "free",
+            "consumed_from": consumed_from,
+            "daily_used": new_daily, "bonus_credits": new_bonus,
+            "monthly_used": 0,
+            "remaining_after": new_total, "reason": "ok"
+        }
     else:
-        # Should not reach here (total_remaining > 0 above), but defensive
+        # ---------- PAID TIER ---------- (creator/pro/agency)
+        new_monthly = state["monthly_used"] + 1
+        try:
+            supa.table("users").update({
+                "monthly_used": new_monthly,
+            }).eq("id", user_id).execute()
+        except Exception as e:
+            print(f"[quota] _consume_user_quota (paid) update failed for {user_id}: {e}")
+            return {
+                "ok": False, "tier": state["tier"],
+                "consumed_from": "none",
+                "daily_used": 0, "bonus_credits": 0,
+                "monthly_used": state["monthly_used"],
+                "remaining_after": state["total_remaining"],
+                "reason": f"update_failed: {str(e)[:80]}"
+            }
+        # Best-effort log
+        try:
+            supa.table("usage_logs").insert({
+                "user_id": user_id, "source": "monthly",
+            }).execute()
+        except Exception as e:
+            print(f"[quota] usage_log insert failed (non-blocking): {e}")
+
+        new_monthly_remaining = max(0, state["monthly_limit"] - new_monthly)
         return {
-            "ok": False, "consumed_from": "none",
-            "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
-            "remaining_after": 0, "reason": "exhausted_unexpected"
+            "ok": True, "tier": state["tier"],
+            "consumed_from": "monthly",
+            "daily_used": 0, "bonus_credits": 0,
+            "monthly_used": new_monthly,
+            "remaining_after": new_monthly_remaining, "reason": "ok"
         }
-
-    # Write the new state
-    try:
-        supa.table("users").update({
-            "daily_used": new_daily,
-            "bonus_credits": new_bonus,
-        }).eq("id", user_id).execute()
-    except Exception as e:
-        print(f"[quota] _consume_user_quota update failed for {user_id}: {e}")
-        return {
-            "ok": False, "consumed_from": "none",
-            "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
-            "remaining_after": state["total_remaining"],
-            "reason": f"update_failed: {str(e)[:80]}"
-        }
-
-    # Best-effort log to usage_logs (non-blocking — don't fail consumption if log fails)
-    try:
-        supa.table("usage_logs").insert({
-            "user_id": user_id,
-            "source": consumed_from,
-        }).execute()
-    except Exception as e:
-        print(f"[quota] usage_log insert failed (non-blocking): {e}")
-
-    new_daily_remaining = max(0, USER_DAILY_LIMIT - new_daily)
-    new_total = new_daily_remaining + new_bonus
-    return {
-        "ok": True, "consumed_from": consumed_from,
-        "daily_used": new_daily, "bonus_credits": new_bonus,
-        "remaining_after": new_total, "reason": "ok"
-    }
 
 
 # ============================================================
