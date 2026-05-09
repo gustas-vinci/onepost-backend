@@ -351,15 +351,45 @@ def _get_user_quota(supa, user_id):
                .limit(1)
                .execute())
         if not res.data or len(res.data) == 0:
-            # User authenticated via JWT but no Supabase row — webhook may not have
-            # synced yet. Treat as anonymous-quota-equivalent (allow but warn).
-            return {
-                "ok": False, "user_id": user_id,
-                "daily_used": 0, "daily_limit": USER_DAILY_LIMIT,
-                "bonus_credits": 0, "daily_remaining": USER_DAILY_LIMIT,
-                "total_remaining": USER_DAILY_LIMIT, "allowed": True,
-                "reason": "no_user_row"
-            }
+            # User authenticated via JWT but no Supabase row found.
+            # This happens when:
+            #   - Webhook silently failed during signup
+            #   - User signed up before webhook was configured
+            #   - Network/Render-sleep caused webhook delivery to fail
+            # Lazy creation: fetch user from Clerk API, create the row now.
+            print(f"[quota] no_user_row for {user_id} — attempting lazy creation")
+            created = _lazy_create_user(supa, user_id)
+            if created:
+                # Re-query to get the fresh row
+                res = (supa.table("users")
+                       .select("id, daily_used, bonus_credits, daily_reset_at")
+                       .eq("id", user_id)
+                       .limit(1)
+                       .execute())
+                if res.data and len(res.data) > 0:
+                    print(f"[quota] lazy creation succeeded for {user_id}")
+                    # Fall through to normal processing below
+                else:
+                    # Lazy creation reported success but row not findable — odd
+                    print(f"[quota] lazy creation reported OK but row not found for {user_id}")
+                    return {
+                        "ok": False, "user_id": user_id,
+                        "daily_used": 0, "daily_limit": USER_DAILY_LIMIT,
+                        "bonus_credits": 0, "daily_remaining": USER_DAILY_LIMIT,
+                        "total_remaining": USER_DAILY_LIMIT, "allowed": True,
+                        "reason": "lazy_create_inconsistent"
+                    }
+            else:
+                # Lazy creation failed (Clerk API down, abuse block, etc.)
+                # Fall back to old behavior: allow but warn.
+                print(f"[quota] lazy creation failed for {user_id}, falling back to no-tracking")
+                return {
+                    "ok": False, "user_id": user_id,
+                    "daily_used": 0, "daily_limit": USER_DAILY_LIMIT,
+                    "bonus_credits": 0, "daily_remaining": USER_DAILY_LIMIT,
+                    "total_remaining": USER_DAILY_LIMIT, "allowed": True,
+                    "reason": "no_user_row_lazy_failed"
+                }
         row = res.data[0]
         daily_used = int(row.get("daily_used") or 0)
         bonus_credits = int(row.get("bonus_credits") or 0)
@@ -398,6 +428,117 @@ def _get_user_quota(supa, user_id):
             "total_remaining": USER_DAILY_LIMIT, "allowed": True,
             "reason": f"db_error: {str(e)[:80]}"
         }
+
+
+# ============================================================
+# LAZY USER CREATION (defense-in-depth for missing webhook rows)
+# ------------------------------------------------------------
+# When backend receives a JWT for a user not in our DB, fetch their
+# info from Clerk's REST API and create the row on-demand. This means
+# even if the webhook silently fails (Render asleep, network blip,
+# Clerk retry exhausted, etc.), users still get rows on first authed
+# API call. Belt-and-suspenders complement to the webhook path.
+# ============================================================
+def _lazy_create_user(supa, user_id):
+    """Create a Supabase users row by fetching info from Clerk's API.
+
+    Returns True if the row exists in DB after this function (whether
+    we created it or it was already there). Returns False on hard failure.
+
+    Idempotent: if row already exists, returns True without changes.
+    Runs Layer A (alias dedup) protection same as webhook does.
+    """
+    if not user_id:
+        return False
+
+    # Quick check: maybe row already exists (race with another lazy-create)
+    try:
+        existing = supa.table("users").select("id").eq("id", user_id).limit(1).execute()
+        if existing.data and len(existing.data) > 0:
+            return True
+    except Exception:
+        pass  # fall through to creation
+
+    # Fetch user info from Clerk's REST API
+    secret = (os.getenv("CLERK_SECRET_KEY") or "").strip()
+    if not secret:
+        print(f"[lazy-create] CLERK_SECRET_KEY not set — cannot fetch user {user_id}")
+        return False
+
+    try:
+        api_resp = requests.get(
+            f"https://api.clerk.com/v1/users/{user_id}",
+            headers={"Authorization": f"Bearer {secret}"},
+            timeout=8,
+        )
+    except Exception as e:
+        print(f"[lazy-create] Clerk API request failed for {user_id}: {e}")
+        return False
+
+    if api_resp.status_code != 200:
+        print(f"[lazy-create] Clerk API returned {api_resp.status_code} for {user_id}: {api_resp.text[:200]}")
+        return False
+
+    try:
+        clerk_data = api_resp.json()
+    except Exception as e:
+        print(f"[lazy-create] Clerk API JSON parse failed for {user_id}: {e}")
+        return False
+
+    # Extract email same way webhook does
+    email = ""
+    try:
+        email_list = clerk_data.get("email_addresses", []) or []
+        primary_id = clerk_data.get("primary_email_address_id", "")
+        for em in email_list:
+            if em.get("id") == primary_id:
+                email = (em.get("email_address") or "").strip().lower()
+                break
+        if not email and email_list:
+            email = (email_list[0].get("email_address") or "").strip().lower()
+    except Exception as e:
+        print(f"[lazy-create] email parse error for {user_id}: {e}")
+
+    first_name = (clerk_data.get("first_name") or "").strip()
+    last_name = (clerk_data.get("last_name") or "").strip()
+    name = (first_name + " " + last_name).strip() or (clerk_data.get("username") or "").strip()
+
+    # Layer A protection: alias dedup
+    normalized = _normalize_email(email) if email else ""
+    if normalized:
+        try:
+            dup = supa.table("users").select("id").eq("normalized_email", normalized).limit(1).execute()
+            if dup.data and len(dup.data) > 0 and dup.data[0]["id"] != user_id:
+                # Different Clerk user already has this normalized email — block.
+                # Don't create the row. User effectively gets no_user_row treatment.
+                print(f"[lazy-create] [BLOCKED-ALIAS] {user_id} ({email}) "
+                      f"normalized to '{normalized}' belongs to {dup.data[0]['id']}")
+                return False
+        except Exception as dedup_err:
+            print(f"[lazy-create] dedup check failed (proceeding): {dedup_err}")
+
+    # Insert the row
+    row = {
+        "id": user_id,
+        "email": email or f"{user_id}@unknown.local",
+        "normalized_email": normalized or None,
+        "name": name or None,
+        "bonus_credits": 2,
+        "daily_used": 0,
+    }
+    try:
+        supa.table("users").insert(row).execute()
+        print(f"[lazy-create] [OK] created user {user_id} ({email}) norm='{normalized}'")
+        return True
+    except Exception as ins_err:
+        err_str = str(ins_err)
+        if "duplicate key" in err_str.lower() or "23505" in err_str:
+            # Race condition — another request already inserted it. Treat as success.
+            print(f"[lazy-create] {user_id} already exists (race) — OK")
+            return True
+        print(f"[lazy-create] insert failed for {user_id}: {err_str[:200]}")
+        return False
+
 
 
 def _consume_user_quota(supa, user_id):
