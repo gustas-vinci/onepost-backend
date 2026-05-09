@@ -1684,6 +1684,45 @@ def signup_metadata():
                     "reason": "already_synced",
                     "user_id": user_id
                 }), 200
+        else:
+            # NO row exists for this Clerk user — orphan from a missed webhook.
+            # Don't run Layer C (it would unfairly count this real existing user
+            # against the IP rate-limit). Instead: lazy-create their row using
+            # Clerk's API, then treat them as a returning user.
+            # This handles users who signed up before the webhook was reliable,
+            # OR where Clerk's webhook delivery silently failed.
+            print(f"[signup-metadata] no row for {user_id} — attempting lazy creation before abuse checks")
+            created = _lazy_create_user(supa, user_id)
+            if created:
+                # Now write the fingerprint+IP we just received. They're effectively a fresh
+                # signup metadata sync at this point — but with no abuse-check penalty since
+                # we already recovered them as an orphan.
+                try:
+                    supa.table("users").update({
+                        "signup_fingerprint": fingerprint or None,
+                        "signup_ip": ip or None,
+                    }).eq("id", user_id).execute()
+                    print(f"[signup-metadata] [ORPHAN-RECOVERED] {user_id} lazy-created + metadata stored")
+                except Exception as upd_err:
+                    print(f"[signup-metadata] orphan metadata update failed: {upd_err}")
+                return jsonify({
+                    "ok": True,
+                    "stored": True,
+                    "orphan_recovered": True,
+                    "reason": "lazy_created",
+                    "user_id": user_id
+                }), 200
+            else:
+                # Lazy creation failed (Clerk API down or alias-block).
+                # Don't sign them out — fail open and let them continue as anonymous-equivalent.
+                # The /check-quota endpoint will also try lazy creation, so they get another chance.
+                print(f"[signup-metadata] lazy creation failed for orphan {user_id} — failing open")
+                return jsonify({
+                    "ok": True,
+                    "stored": False,
+                    "reason": "lazy_create_failed_failing_open",
+                    "user_id": user_id
+                }), 200
     except Exception as e:
         # Idempotency check failed — proceed with abuse checks (safe fallback)
         print(f"[signup-metadata] idempotency check failed (proceeding): {e}")
