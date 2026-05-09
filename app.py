@@ -335,11 +335,11 @@ def _get_tier_limits(tier):
     if t == "free":
         return {"kind": "daily", "daily": USER_DAILY_LIMIT, "monthly": None, "bonus_eligible": True}
     if t == "creator":
-        return {"kind": "monthly", "daily": None, "monthly": 60, "bonus_eligible": False}
+        return {"kind": "monthly", "daily": None, "monthly": 240, "bonus_eligible": False}
     if t == "pro":
-        return {"kind": "monthly", "daily": None, "monthly": 100, "bonus_eligible": False}
+        return {"kind": "monthly", "daily": None, "monthly": 400, "bonus_eligible": False}
     if t == "agency":
-        return {"kind": "monthly", "daily": None, "monthly": 500, "bonus_eligible": False}
+        return {"kind": "monthly", "daily": None, "monthly": 2000, "bonus_eligible": False}
     print(f"[tier] unknown tier '{tier}' — falling back to free")
     return {"kind": "daily", "daily": USER_DAILY_LIMIT, "monthly": None, "bonus_eligible": True}
 
