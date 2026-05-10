@@ -58,6 +58,81 @@ def _get_supabase():
 
 
 # ============================================================
+# RAZORPAY SDK — optional dep, lazy client init
+# ============================================================
+# Same pattern as Supabase: import wrapped in try/except so missing libs
+# don't crash the app. Razorpay endpoints return a clear error if the SDK
+# isn't installed or keys aren't configured. Anonymous + free users are
+# completely unaffected — only paid checkout/webhook routes use this.
+# ============================================================
+_RAZORPAY_DEPS_OK = False
+_RAZORPAY_DEPS_ERR = ""
+_razorpay_client = None
+try:
+    import razorpay as _razorpay
+    _RAZORPAY_DEPS_OK = True
+    print("[razorpay-deps] razorpay lib imported OK")
+except Exception as _rzp_imp_err:
+    _RAZORPAY_DEPS_ERR = f"import_failed: {str(_rzp_imp_err)[:160]}"
+    print(f"[razorpay-deps] {_RAZORPAY_DEPS_ERR}")
+
+
+def _get_razorpay():
+    """Lazy-init the Razorpay client. Returns None if unavailable.
+    Never raises — callers handle None as 'razorpay temporarily unavailable'."""
+    global _razorpay_client
+    if _razorpay_client is not None:
+        return _razorpay_client
+    if not _RAZORPAY_DEPS_OK:
+        return None
+    key_id = (os.getenv("RAZORPAY_KEY_ID") or "").strip()
+    key_secret = (os.getenv("RAZORPAY_KEY_SECRET") or "").strip()
+    if not key_id or not key_secret:
+        print("[razorpay] RAZORPAY_KEY_ID or RAZORPAY_KEY_SECRET missing")
+        return None
+    # Sanity check: live keys start with rzp_live_, test with rzp_test_
+    # We don't enforce this strictly (allow either) but warn if it's neither
+    if not (key_id.startswith("rzp_live_") or key_id.startswith("rzp_test_")):
+        print(f"[razorpay] WARN: RAZORPAY_KEY_ID has unexpected prefix: {key_id[:10]}...")
+    try:
+        _razorpay_client = _razorpay.Client(auth=(key_id, key_secret))
+        print(f"[razorpay] client initialized (key_id prefix: {key_id[:9]}...)")
+        return _razorpay_client
+    except Exception as e:
+        print(f"[razorpay] init failed: {e}")
+        return None
+
+
+# ============================================================
+# TIER + CYCLE → RAZORPAY PLAN ID LOOKUP
+# ============================================================
+# Maps (tier, cycle) → env var name → plan_id string.
+# Tier values: 'creator' | 'pro' | 'agency'   (free is not paid, no plan)
+# Cycle values: 'monthly' | 'yearly'
+#
+# Returns the plan_id string from env vars, or None if missing.
+# We DO NOT hard-code plan IDs — they live in env vars so test/live keys
+# can be swapped without code changes.
+# ============================================================
+def _get_razorpay_plan_id(tier, cycle):
+    """Return the Razorpay plan_id for a given tier+cycle, or None if missing.
+    Never raises."""
+    t = (tier or "").strip().lower()
+    c = (cycle or "").strip().lower()
+    valid_tiers = {"creator", "pro", "agency"}
+    valid_cycles = {"monthly", "yearly"}
+    if t not in valid_tiers or c not in valid_cycles:
+        print(f"[razorpay] _get_razorpay_plan_id: invalid tier={tier} or cycle={cycle}")
+        return None
+    env_var = f"RAZORPAY_PLAN_{t.upper()}_{c.upper()}"
+    plan_id = (os.getenv(env_var) or "").strip()
+    if not plan_id:
+        print(f"[razorpay] env var {env_var} not set")
+        return None
+    return plan_id
+
+
+# ============================================================
 # ANTI-ABUSE — Email normalization (Layer A: catches Tier 2 abuse)
 # ============================================================
 # Gmail and Googlemail treat dots and +aliases as identical:
@@ -1926,9 +2001,151 @@ def signup_metadata():
 
 
 # ============================================================
+# /api/checkout/razorpay/create-subscription
+# ------------------------------------------------------------
+# Creates a Razorpay subscription for an authenticated user.
+# Frontend calls this when user clicks a paid-tier CTA. We:
+#   1. Verify the Clerk JWT (proves user is signed in)
+#   2. Read tier + cycle from the request body
+#   3. Look up the matching plan_id from Render env vars
+#   4. Call Razorpay's API to create a subscription
+#   5. Stash the subscription_id + plan_id on the user's row
+#      (status='created' — webhook will flip to 'active' when paid)
+#   6. Return Razorpay's hosted checkout URL (short_url)
+#
+# Frontend then redirects user to short_url. User pays. Razorpay
+# webhook (Task 6) tells us "paid", we update tier to active.
+#
+# Request body:
+#   { "tier": "creator"|"pro"|"agency", "cycle": "monthly"|"yearly" }
+#
+# Response (success):
+#   200 { "ok": true, "short_url": "...", "subscription_id": "...",
+#         "plan_id": "...", "tier": "...", "cycle": "..." }
+#
+# Response (error):
+#   401 unauthorized                 — no JWT or invalid
+#   400 bad_request                  — invalid tier/cycle
+#   503 razorpay_unavailable         — SDK not installed or keys missing
+#   503 plan_not_configured          — env var for that plan_id missing
+#   500 razorpay_api_error           — Razorpay API returned an error
+#   500 db_error                     — couldn't store subscription_id on user row
+# ============================================================
+@app.route("/api/checkout/razorpay/create-subscription", methods=["POST", "OPTIONS"])
+def razorpay_create_subscription():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    # 1. Verify auth (Clerk JWT required — only signed-in users can subscribe)
+    if not _AUTH_DEPS_OK:
+        return jsonify({"ok": False, "error": "auth_deps_unavailable", "detail": _AUTH_DEPS_ERR}), 503
+    user_id, jwt_err = _verify_clerk_jwt(request)
+    if not user_id:
+        print(f"[rzp-checkout] JWT verification failed: {jwt_err}")
+        return jsonify({"ok": False, "error": "unauthorized", "detail": jwt_err}), 401
+
+    # 2. Parse request body
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        body = {}
+    tier = (body.get("tier") or "").strip().lower()
+    cycle = (body.get("cycle") or "").strip().lower()
+    if tier not in {"creator", "pro", "agency"}:
+        return jsonify({"ok": False, "error": "bad_request",
+                        "detail": f"invalid tier: {tier!r}"}), 400
+    if cycle not in {"monthly", "yearly"}:
+        return jsonify({"ok": False, "error": "bad_request",
+                        "detail": f"invalid cycle: {cycle!r}"}), 400
+
+    # 3. Look up plan_id from env
+    plan_id = _get_razorpay_plan_id(tier, cycle)
+    if not plan_id:
+        return jsonify({"ok": False, "error": "plan_not_configured",
+                        "detail": f"no env var for tier={tier} cycle={cycle}"}), 503
+
+    # 4. Get Razorpay client
+    rzp = _get_razorpay()
+    if rzp is None:
+        return jsonify({"ok": False, "error": "razorpay_unavailable",
+                        "detail": _RAZORPAY_DEPS_ERR or "client_init_failed"}), 503
+
+    # 5. Get Supabase (we need it to record the subscription_id on the user)
+    supa = _get_supabase()
+    if supa is None:
+        return jsonify({"ok": False, "error": "supabase_unavailable"}), 503
+
+    # 6. Create the subscription via Razorpay API
+    # total_count = number of billing cycles before Razorpay auto-stops the subscription.
+    # We use 120 (10 years) for monthly and 10 (10 years) for yearly — effectively indefinite.
+    # User can cancel any time via "My Account" → portal link. Industry-standard SaaS behavior
+    # (Spotify, Notion, Figma all use similar long-running subscriptions). Razorpay's hard max
+    # is around 240, so this leaves headroom. If we ever need to extend further, we can update
+    # active subscriptions via the Razorpay API.
+    total_count = 120 if cycle == "monthly" else 10
+
+    # customer_notify=1 → Razorpay sends payment-related emails to user
+    # quantity=1 → one unit of the plan (we don't multi-seat)
+    try:
+        sub = rzp.subscription.create({
+            "plan_id": plan_id,
+            "total_count": total_count,
+            "quantity": 1,
+            "customer_notify": 1,
+            "notes": {
+                "user_id": user_id,
+                "tier": tier,
+                "cycle": cycle,
+            },
+        })
+    except Exception as e:
+        err_str = str(e)[:300]
+        print(f"[rzp-checkout] Razorpay API error for user={user_id} tier={tier}: {err_str}")
+        return jsonify({"ok": False, "error": "razorpay_api_error",
+                        "detail": err_str}), 500
+
+    subscription_id = sub.get("id", "")
+    short_url = sub.get("short_url", "")
+    if not subscription_id or not short_url:
+        print(f"[rzp-checkout] Razorpay returned incomplete response: {sub}")
+        return jsonify({"ok": False, "error": "razorpay_bad_response",
+                        "detail": "missing id or short_url"}), 500
+
+    # 7. Stash subscription_id + plan_id on the user row.
+    # Status is 'created' — the webhook flips this to 'active' when payment succeeds.
+    # We DO NOT change tier yet — webhook is the authoritative tier-flip.
+    # If user abandons checkout, this row stays with subscription_status='created',
+    # which is fine — they're still tier='free' and unaffected.
+    try:
+        supa.table("users").update({
+            "subscription_id": subscription_id,
+            "plan_id": plan_id,
+            "subscription_status": "created",
+            "payment_provider": "razorpay",
+        }).eq("id", user_id).execute()
+        print(f"[rzp-checkout] [OK] user={user_id} tier={tier} cycle={cycle} "
+              f"sub={subscription_id} plan={plan_id}")
+    except Exception as e:
+        # Razorpay subscription is already created at this point — we shouldn't fail the request
+        # because the user can still pay. We log loud and proceed.
+        print(f"[rzp-checkout] DB update failed (proceeding anyway): {e}")
+
+    # 8. Return the hosted checkout URL — frontend redirects user there
+    return jsonify({
+        "ok": True,
+        "short_url": short_url,
+        "subscription_id": subscription_id,
+        "plan_id": plan_id,
+        "tier": tier,
+        "cycle": cycle,
+    }), 200
+
+
+
+# ============================================================
 # /api/auth-debug — diagnostic endpoint, safe to call anytime.
-# Reports whether auth deps are configured correctly. Does NOT
-# expose any secrets — only their PRESENCE/ABSENCE and lengths.
+# Reports whether auth deps + Razorpay are configured correctly.
+# Does NOT expose any secrets — only their PRESENCE/ABSENCE.
 # ============================================================
 @app.route("/api/auth-debug", methods=["GET", "OPTIONS"])
 def auth_debug():
@@ -1936,6 +2153,7 @@ def auth_debug():
         return jsonify({"ok": True}), 200
     supa = _get_supabase()
     jwks = _get_jwks_client()
+    rzp = _get_razorpay()
     return jsonify({
         "auth_deps_imported": _AUTH_DEPS_OK,
         "auth_deps_error": _AUTH_DEPS_ERR if not _AUTH_DEPS_OK else "",
@@ -1948,6 +2166,20 @@ def auth_debug():
         "jwks_init_error": _jwks_init_err if jwks is None else "",
         "signup_fp_limit": int((os.getenv("SIGNUP_FP_LIMIT") or "2").strip()),
         "signup_ip_limit_24h": int((os.getenv("SIGNUP_IP_LIMIT_24H") or "5").strip()),
+        # ---- Razorpay diagnostics (Task 5) ----
+        "razorpay_deps_imported": _RAZORPAY_DEPS_OK,
+        "razorpay_deps_error": _RAZORPAY_DEPS_ERR if not _RAZORPAY_DEPS_OK else "",
+        "razorpay_key_id_set": bool((os.getenv("RAZORPAY_KEY_ID") or "").strip()),
+        "razorpay_key_secret_set": bool((os.getenv("RAZORPAY_KEY_SECRET") or "").strip()),
+        "razorpay_client_ready": rzp is not None,
+        "razorpay_plans_configured": {
+            "creator_monthly": bool((os.getenv("RAZORPAY_PLAN_CREATOR_MONTHLY") or "").strip()),
+            "creator_yearly":  bool((os.getenv("RAZORPAY_PLAN_CREATOR_YEARLY") or "").strip()),
+            "pro_monthly":     bool((os.getenv("RAZORPAY_PLAN_PRO_MONTHLY") or "").strip()),
+            "pro_yearly":      bool((os.getenv("RAZORPAY_PLAN_PRO_YEARLY") or "").strip()),
+            "agency_monthly":  bool((os.getenv("RAZORPAY_PLAN_AGENCY_MONTHLY") or "").strip()),
+            "agency_yearly":   bool((os.getenv("RAZORPAY_PLAN_AGENCY_YEARLY") or "").strip()),
+        },
     })
 
 
