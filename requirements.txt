@@ -1,16 +1,9 @@
-# OnePost Backend Dependencies
-
-# Core (existing, deployed Day 1)
-flask>=3.0.0
-flask-cors>=4.0.0
-requests>=2.31.0
-python-dotenv>=1.0.0
-gunicorn>=21.2.0
-
-# Day 2 — Clerk webhook signature verification + Supabase client
+flask
+flask-cors
+python-dotenv
+requests
 svix>=1.30.0
 supabase>=2.5.0
-
-# Day 3 — Clerk session JWT verification (networkless via JWKS)
-# PyJWT[crypto] includes cryptography for RS256 signature verification
+gunicorn>=21.2.0
 PyJWT[crypto]>=2.8.0
+razorpay>=1.4.2
