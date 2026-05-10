@@ -2143,6 +2143,312 @@ def razorpay_create_subscription():
 
 
 # ============================================================
+# /api/webhooks/razorpay — receives subscription lifecycle events
+# ------------------------------------------------------------
+# Razorpay POSTs here on every subscription event. This is what
+# actually moves users between tiers. Without this, payments
+# don't translate to tier upgrades.
+#
+# SECURITY: Verifies the X-Razorpay-Signature header using
+# RAZORPAY_WEBHOOK_SECRET. Without verification, anyone could
+# POST fake "user paid" events to upgrade themselves.
+#
+# IDEMPOTENCY: Razorpay retries failed webhooks. We use the
+# webhook_events table (PRIMARY KEY on event_id) to detect
+# duplicate deliveries and no-op on retries.
+#
+# EVENT HANDLING:
+#   subscription.activated → flip to paid tier, set period dates, monthly_used=0
+#   subscription.charged   → renewal: roll period dates, reset monthly_used=0
+#   subscription.cancelled → mark status='cancelled', tier preserved (B-simple
+#                            cancel-at-period-end via _is_period_active safety net)
+#   subscription.halted    → payment failures stopped retrying, downgrade to free
+#   subscription.completed → total_count reached (10 years), downgrade to free
+#   subscription.paused    → status='paused', tier preserved (treat like cancelled)
+#
+# Always returns 200 so Razorpay doesn't retry. Errors are logged loud.
+# ============================================================
+import hmac as _hmac
+import hashlib as _hashlib
+
+def _verify_razorpay_signature(raw_body, signature_header, secret):
+    """Verify Razorpay webhook signature.
+    Razorpay signs webhooks with HMAC-SHA256(secret, raw_body).
+    Returns True if signature is valid, False otherwise. Never raises."""
+    if not signature_header or not secret:
+        return False
+    try:
+        expected = _hmac.new(
+            secret.encode("utf-8"),
+            raw_body,
+            _hashlib.sha256,
+        ).hexdigest()
+        # Use compare_digest to prevent timing attacks
+        return _hmac.compare_digest(expected, signature_header)
+    except Exception as e:
+        print(f"[rzp-webhook] signature verify error: {e}")
+        return False
+
+
+def _ts_to_iso(ts):
+    """Convert Razorpay's epoch timestamp (seconds, int) to ISO 8601 UTC string.
+    Returns empty string if ts is None/invalid. Never raises."""
+    if ts is None:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+    except Exception:
+        return ""
+
+
+def _tier_from_plan_id(plan_id):
+    """Reverse-lookup: given a Razorpay plan_id, return the tier name.
+    Reads env vars to figure out which plan_id corresponds to which tier+cycle.
+    Returns ('creator'|'pro'|'agency'|'', 'monthly'|'yearly'|''). Never raises.
+
+    Used when subscription.activated fires — we need to know which tier the
+    user just bought. We could read it from notes.tier, but reverse-lookup
+    via plan_id is more authoritative (notes can be tampered, plan_id can't).
+    """
+    if not plan_id:
+        return "", ""
+    plan_id = plan_id.strip()
+    for tier in ("creator", "pro", "agency"):
+        for cycle in ("monthly", "yearly"):
+            env_var = f"RAZORPAY_PLAN_{tier.upper()}_{cycle.upper()}"
+            if (os.getenv(env_var) or "").strip() == plan_id:
+                return tier, cycle
+    return "", ""
+
+
+@app.route("/api/webhooks/razorpay", methods=["POST", "OPTIONS"])
+def razorpay_webhook():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    # 1. Get the webhook secret
+    secret = (os.getenv("RAZORPAY_WEBHOOK_SECRET") or "").strip()
+    if not secret:
+        # No secret configured — accept (200) so Razorpay doesn't retry forever,
+        # but log loud. This means we can't verify any webhook until secret is set.
+        print("[rzp-webhook] RAZORPAY_WEBHOOK_SECRET not configured — refusing")
+        return jsonify({"ok": False, "error": "webhook_secret_missing"}), 503
+
+    # 2. Get raw body + signature header
+    raw_body = request.get_data()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+
+    # 3. Verify signature
+    if not _verify_razorpay_signature(raw_body, signature, secret):
+        print(f"[rzp-webhook] signature verification failed (sig={signature[:20]}...)")
+        return jsonify({"ok": False, "error": "bad_signature"}), 401
+
+    # 4. Parse JSON payload
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+    except Exception as e:
+        print(f"[rzp-webhook] JSON parse error: {e}")
+        return jsonify({"ok": False, "error": "bad_json"}), 400
+
+    event_type = payload.get("event", "")
+    event_id = ""
+    # Razorpay's event_id is at payload.id OR payload.payload.subscription.entity.id
+    # Best practice: use payload.id (the event-level id, unique per webhook delivery)
+    event_id = payload.get("id", "") or payload.get("event_id", "")
+
+    if not event_id:
+        # Fallback: synthesize an id from event type + entity id + timestamp
+        # This is defensive — every Razorpay payload SHOULD have id, but...
+        sub_obj = (payload.get("payload", {}) or {}).get("subscription", {}) or {}
+        sub_entity = sub_obj.get("entity", {}) or {}
+        sub_id = sub_entity.get("id", "")
+        ts = payload.get("created_at", "")
+        event_id = f"synth_{event_type}_{sub_id}_{ts}"
+        print(f"[rzp-webhook] WARN: payload missing id field, using synth: {event_id}")
+
+    print(f"[rzp-webhook] received event={event_type} id={event_id}")
+
+    # 5. Get Supabase
+    supa = _get_supabase()
+    if supa is None:
+        # Without Supabase, we can't process. Return 500 so Razorpay retries
+        # later when (hopefully) Supabase is back up.
+        print("[rzp-webhook] Supabase unavailable — returning 500 for retry")
+        return jsonify({"ok": False, "error": "supabase_unavailable"}), 500
+
+    # 6. Idempotency check via webhook_events table
+    # Insert with PRIMARY KEY on event_id — duplicate delivery throws, we handle gracefully.
+    try:
+        supa.table("webhook_events").insert({
+            "event_id": event_id,
+            "provider": "razorpay",
+            "event_type": event_type,
+            "payload": payload,
+            "status": "received",
+        }).execute()
+    except Exception as ins_err:
+        err_str = str(ins_err)
+        if "duplicate key" in err_str.lower() or "23505" in err_str:
+            # Already processed — return 200, no-op
+            print(f"[rzp-webhook] duplicate event {event_id} — already processed, skipping")
+            return jsonify({"ok": True, "duplicate": True, "event_id": event_id}), 200
+        # Other DB error — log and retry-by-returning-500
+        print(f"[rzp-webhook] webhook_events insert failed: {err_str[:200]}")
+        return jsonify({"ok": False, "error": "db_insert_failed"}), 500
+
+    # 7. Extract subscription details from payload
+    # Razorpay payload structure: payload.payload.subscription.entity = {id, plan_id, status, current_start, current_end, notes, ...}
+    sub_obj = (payload.get("payload", {}) or {}).get("subscription", {}) or {}
+    sub_entity = sub_obj.get("entity", {}) or {}
+    subscription_id = sub_entity.get("id", "")
+    plan_id = sub_entity.get("plan_id", "")
+    notes = sub_entity.get("notes", {}) or {}
+    user_id = notes.get("user_id", "")
+    current_start = sub_entity.get("current_start")  # epoch seconds
+    current_end = sub_entity.get("current_end")      # epoch seconds
+
+    if not user_id:
+        # No user_id in notes — can't proceed. This shouldn't happen if checkout
+        # flow worked correctly (we set notes.user_id there).
+        print(f"[rzp-webhook] WARN: no user_id in notes for sub={subscription_id}")
+        # Mark webhook event as failed but return 200 (don't retry — won't help)
+        try:
+            supa.table("webhook_events").update({
+                "status": "failed",
+                "processed_at": _now_utc().isoformat(),
+            }).eq("event_id", event_id).execute()
+        except Exception:
+            pass
+        return jsonify({"ok": True, "skipped": True, "reason": "no_user_id_in_notes"}), 200
+
+    # 8. Branch on event type and update user row accordingly
+    update_fields = None  # dict of fields to update on users row, or None to skip
+    extra_log = ""
+
+    if event_type == "subscription.activated":
+        # First-time activation: flip to paid tier, set period dates, reset counters.
+        tier, cycle = _tier_from_plan_id(plan_id)
+        if not tier:
+            print(f"[rzp-webhook] WARN: unknown plan_id {plan_id} on activation — skipping tier flip")
+            # Still update status so webhook isn't lost
+            update_fields = {
+                "subscription_status": "active",
+                "subscription_id": subscription_id,
+                "plan_id": plan_id,
+            }
+        else:
+            update_fields = {
+                "tier": tier,
+                "subscription_status": "active",
+                "subscription_id": subscription_id,
+                "plan_id": plan_id,
+                "payment_provider": "razorpay",
+                "current_period_start": _ts_to_iso(current_start),
+                "current_period_end": _ts_to_iso(current_end),
+                "monthly_used": 0,
+            }
+            extra_log = f"tier={tier} cycle={cycle}"
+
+    elif event_type == "subscription.charged":
+        # Renewal payment succeeded — roll period dates, reset monthly_used.
+        # Note: also fires on first payment after activation. That's fine — we'd just
+        # re-set monthly_used=0 (already 0 from activation), no harm done.
+        update_fields = {
+            "subscription_status": "active",
+            "current_period_start": _ts_to_iso(current_start),
+            "current_period_end": _ts_to_iso(current_end),
+            "monthly_used": 0,
+        }
+        extra_log = "renewal"
+
+    elif event_type == "subscription.cancelled":
+        # User cancelled. B-simple flavor: set status='cancelled', tier preserved.
+        # _is_period_active() safety net auto-treats them as free after period_end.
+        update_fields = {
+            "subscription_status": "cancelled",
+        }
+        extra_log = f"cancelled, tier preserved until period_end"
+
+    elif event_type == "subscription.halted":
+        # Card declined repeatedly, Razorpay gave up. Immediate downgrade to free.
+        update_fields = {
+            "tier": "free",
+            "subscription_status": "halted",
+            "current_period_end": None,
+        }
+        extra_log = "halted, downgraded to free"
+
+    elif event_type == "subscription.completed":
+        # total_count reached (10 years with our settings, so this is rare).
+        # Downgrade to free.
+        update_fields = {
+            "tier": "free",
+            "subscription_status": "expired",
+            "current_period_end": None,
+        }
+        extra_log = "completed (total_count reached), downgraded to free"
+
+    elif event_type == "subscription.paused":
+        # User paused the sub. Treat like cancelled — preserve tier until period end.
+        update_fields = {
+            "subscription_status": "paused",
+        }
+        extra_log = "paused, tier preserved until period_end"
+
+    elif event_type == "subscription.resumed":
+        # User unpaused. Flip status back to active, period dates already valid.
+        update_fields = {
+            "subscription_status": "active",
+        }
+        extra_log = "resumed"
+
+    else:
+        # Unknown event type — log and accept. Don't error (Razorpay would retry).
+        print(f"[rzp-webhook] ignoring unknown event_type={event_type}")
+        try:
+            supa.table("webhook_events").update({
+                "status": "skipped",
+                "processed_at": _now_utc().isoformat(),
+            }).eq("event_id", event_id).execute()
+        except Exception:
+            pass
+        return jsonify({"ok": True, "ignored": True, "event_type": event_type}), 200
+
+    # 9. Apply the update (if any)
+    if update_fields is not None:
+        try:
+            supa.table("users").update(update_fields).eq("id", user_id).execute()
+            print(f"[rzp-webhook] [OK] event={event_type} user={user_id} sub={subscription_id} {extra_log}")
+        except Exception as e:
+            err_str = str(e)[:200]
+            print(f"[rzp-webhook] DB update failed for user={user_id}: {err_str}")
+            # Mark webhook as failed but return 500 so Razorpay retries
+            try:
+                supa.table("webhook_events").update({
+                    "status": "failed",
+                    "processed_at": _now_utc().isoformat(),
+                }).eq("event_id", event_id).execute()
+            except Exception:
+                pass
+            return jsonify({"ok": False, "error": "db_update_failed", "detail": err_str}), 500
+
+    # 10. Mark webhook event as processed
+    try:
+        supa.table("webhook_events").update({
+            "status": "processed",
+            "user_id": user_id,
+            "processed_at": _now_utc().isoformat(),
+        }).eq("event_id", event_id).execute()
+    except Exception as e:
+        # Already applied user update — don't fail the webhook. Just log.
+        print(f"[rzp-webhook] webhook_events status update failed (non-blocking): {e}")
+
+    return jsonify({"ok": True, "event_type": event_type, "user_id": user_id}), 200
+
+
+
+# ============================================================
 # /api/auth-debug — diagnostic endpoint, safe to call anytime.
 # Reports whether auth deps + Razorpay are configured correctly.
 # Does NOT expose any secrets — only their PRESENCE/ABSENCE.
@@ -2171,6 +2477,7 @@ def auth_debug():
         "razorpay_deps_error": _RAZORPAY_DEPS_ERR if not _RAZORPAY_DEPS_OK else "",
         "razorpay_key_id_set": bool((os.getenv("RAZORPAY_KEY_ID") or "").strip()),
         "razorpay_key_secret_set": bool((os.getenv("RAZORPAY_KEY_SECRET") or "").strip()),
+        "razorpay_webhook_secret_set": bool((os.getenv("RAZORPAY_WEBHOOK_SECRET") or "").strip()),
         "razorpay_client_ready": rzp is not None,
         "razorpay_plans_configured": {
             "creator_monthly": bool((os.getenv("RAZORPAY_PLAN_CREATOR_MONTHLY") or "").strip()),
