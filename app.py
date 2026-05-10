@@ -752,6 +752,8 @@ def _consume_user_quota(supa, user_id):
             "consumed_from": "none",
             "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
             "monthly_used": state.get("monthly_used", 0),
+            "monthly_limit": state.get("monthly_limit", 0),
+            "monthly_remaining": state.get("monthly_remaining", 0),
             "remaining_after": state["total_remaining"],
             "reason": state["reason"]
         }
@@ -762,6 +764,8 @@ def _consume_user_quota(supa, user_id):
             "consumed_from": "none",
             "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
             "monthly_used": state.get("monthly_used", 0),
+            "monthly_limit": state.get("monthly_limit", 0),
+            "monthly_remaining": state.get("monthly_remaining", 0),
             "remaining_after": 0, "reason": "exhausted"
         }
 
@@ -799,6 +803,8 @@ def _consume_user_quota(supa, user_id):
                 "consumed_from": "none",
                 "daily_used": state["daily_used"], "bonus_credits": state["bonus_credits"],
                 "monthly_used": 0,
+                "monthly_limit": 0,
+                "monthly_remaining": 0,
                 "remaining_after": state["total_remaining"],
                 "reason": f"update_failed: {str(e)[:80]}"
             }
@@ -819,6 +825,8 @@ def _consume_user_quota(supa, user_id):
             "consumed_from": consumed_from,
             "daily_used": new_daily, "bonus_credits": new_bonus,
             "monthly_used": 0,
+            "monthly_limit": 0,
+            "monthly_remaining": 0,
             "remaining_after": new_total, "reason": "ok"
         }
     else:
@@ -835,6 +843,8 @@ def _consume_user_quota(supa, user_id):
                 "consumed_from": "none",
                 "daily_used": 0, "bonus_credits": 0,
                 "monthly_used": state["monthly_used"],
+                "monthly_limit": state["monthly_limit"],
+                "monthly_remaining": state["monthly_remaining"],
                 "remaining_after": state["total_remaining"],
                 "reason": f"update_failed: {str(e)[:80]}"
             }
@@ -852,6 +862,8 @@ def _consume_user_quota(supa, user_id):
             "consumed_from": "monthly",
             "daily_used": 0, "bonus_credits": 0,
             "monthly_used": new_monthly,
+            "monthly_limit": state["monthly_limit"],
+            "monthly_remaining": new_monthly_remaining,
             "remaining_after": new_monthly_remaining, "reason": "ok"
         }
 
@@ -1403,6 +1415,13 @@ def check_quota():
                     "daily_used": state["daily_used"],
                     "daily_remaining": state["daily_remaining"],
                     "bonus_credits": state["bonus_credits"],
+                    # Paid-tier fields (zero for free users — frontend uses 'kind' to branch)
+                    "tier": state["tier"],
+                    "kind": state["kind"],
+                    "monthly_used": state["monthly_used"],
+                    "monthly_limit": state["monthly_limit"],
+                    "monthly_remaining": state["monthly_remaining"],
+                    "current_period_end": state["current_period_end"],
                     "retry_after_seconds": 0,
                     "retry_after_human": "",
                     "note": state["reason"],
@@ -1469,6 +1488,12 @@ def record_generation():
                     "daily_used": result.get("daily_used", 0),
                     "bonus_credits": result.get("bonus_credits", 0),
                     "remaining": result.get("remaining_after", 0),
+                    # Paid-tier fields (zero for free users — frontend uses 'kind' to branch)
+                    "tier": result.get("tier", "free"),
+                    "kind": "monthly" if result.get("tier", "free") in ("creator", "pro", "agency") else "daily",
+                    "monthly_used": result.get("monthly_used", 0),
+                    "monthly_limit": result.get("monthly_limit", 0),
+                    "monthly_remaining": result.get("monthly_remaining", 0),
                     "note": result.get("reason", ""),
                 })
 
@@ -2086,6 +2111,9 @@ def razorpay_create_subscription():
 
     # customer_notify=1 → Razorpay sends payment-related emails to user
     # quantity=1 → one unit of the plan (we don't multi-seat)
+    # Note: Razorpay's subscription.create() does NOT accept a callback_url.
+    # The post-payment redirect is handled on the frontend by appending
+    # ?callback_url=... to the short_url before redirecting (see Task 7 frontend).
     try:
         sub = rzp.subscription.create({
             "plan_id": plan_id,
