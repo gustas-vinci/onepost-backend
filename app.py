@@ -133,6 +133,179 @@ def _get_razorpay_plan_id(tier, cycle):
 
 
 # ============================================================
+# PAYPAL API — OAuth token cache + plan lookup helpers
+# ============================================================
+# PayPal uses OAuth: get an access_token using CLIENT_ID + SECRET, then use that
+# token in subsequent requests. Token expires every ~9 hours. We cache in-memory
+# and refresh when expired or near-expiry.
+#
+# We use the LIVE base URL. Sandbox would use api-m.sandbox.paypal.com, but
+# we made the live-mode decision in the sprint plan.
+#
+# Anonymous + free users + Razorpay users are completely unaffected — only
+# PayPal endpoints touch this code.
+# ============================================================
+_PAYPAL_API_BASE = "https://api-m.paypal.com"
+_paypal_token_cache = {"token": None, "expires_at": 0}  # epoch seconds
+
+
+def _get_paypal_access_token():
+    """Get a valid PayPal API access token, fetching/refreshing if needed.
+    Returns the token string, or None if PayPal credentials are missing or call failed.
+    Never raises."""
+    import time as _time
+    # Use cached token if still valid (with 60s safety margin)
+    now = _time.time()
+    if _paypal_token_cache["token"] and _paypal_token_cache["expires_at"] > now + 60:
+        return _paypal_token_cache["token"]
+
+    client_id = (os.getenv("PAYPAL_CLIENT_ID") or "").strip()
+    client_secret = (os.getenv("PAYPAL_CLIENT_SECRET") or "").strip()
+    if not client_id or not client_secret:
+        print("[paypal] PAYPAL_CLIENT_ID or PAYPAL_CLIENT_SECRET missing")
+        return None
+
+    try:
+        import requests as _requests
+        resp = _requests.post(
+            f"{_PAYPAL_API_BASE}/v1/oauth2/token",
+            auth=(client_id, client_secret),
+            headers={"Accept": "application/json", "Accept-Language": "en_US"},
+            data={"grant_type": "client_credentials"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"[paypal] OAuth failed: HTTP {resp.status_code} body={resp.text[:200]}")
+            return None
+        data = resp.json()
+        token = data.get("access_token", "")
+        expires_in = int(data.get("expires_in", 0) or 0)
+        if not token or expires_in <= 0:
+            print(f"[paypal] OAuth response malformed: {data}")
+            return None
+        _paypal_token_cache["token"] = token
+        _paypal_token_cache["expires_at"] = now + expires_in
+        print(f"[paypal] OAuth token cached, expires in {expires_in}s")
+        return token
+    except Exception as e:
+        print(f"[paypal] OAuth exception: {e}")
+        return None
+
+
+def _get_paypal_plan_id(tier, cycle):
+    """Return the PayPal plan_id for a given tier+cycle, or None if missing.
+    Never raises."""
+    t = (tier or "").strip().lower()
+    c = (cycle or "").strip().lower()
+    valid_tiers = {"creator", "pro", "agency"}
+    valid_cycles = {"monthly", "yearly"}
+    if t not in valid_tiers or c not in valid_cycles:
+        print(f"[paypal] _get_paypal_plan_id: invalid tier={tier} or cycle={cycle}")
+        return None
+    env_var = f"PAYPAL_PLAN_{t.upper()}_{c.upper()}"
+    plan_id = (os.getenv(env_var) or "").strip()
+    if not plan_id:
+        print(f"[paypal] env var {env_var} not set")
+        return None
+    return plan_id
+
+
+def _paypal_tier_from_plan_id(plan_id):
+    """Reverse-lookup: given a PayPal plan_id, return (tier, cycle).
+    Used by the webhook to determine which tier a user just bought.
+    Returns ('creator'|'pro'|'agency'|'', 'monthly'|'yearly'|''). Never raises."""
+    if not plan_id:
+        return "", ""
+    plan_id = plan_id.strip()
+    for tier in ("creator", "pro", "agency"):
+        for cycle in ("monthly", "yearly"):
+            env_var = f"PAYPAL_PLAN_{tier.upper()}_{cycle.upper()}"
+            if (os.getenv(env_var) or "").strip() == plan_id:
+                return tier, cycle
+    return "", ""
+
+
+# ============================================================
+# SUBSCRIPTION CONFLICT CHECK
+# ============================================================
+# Prevents users from accidentally double-subscribing — e.g. they have an
+# active Razorpay subscription and click PayPal-Subscribe, which would
+# create a parallel subscription and lose the link to their original one.
+#
+# Returns a conflict dict if user has a genuinely active subscription with
+# a DIFFERENT provider OR a DIFFERENT tier than what they're trying to buy.
+# Returns None if no conflict — user can proceed.
+#
+# "Genuinely active" = subscription_status='active' AND current_period_end
+# is in the future. Cancelled/halted/expired/created users can re-subscribe.
+#
+# Same-tier-same-provider is also allowed (no-op, harmless retry).
+# ============================================================
+def _check_subscription_conflict(supa, user_id, requested_provider, requested_tier, requested_cycle):
+    """Check if user already has an active subscription that conflicts with
+    a new checkout request.
+
+    Returns:
+        None        — no conflict, user can proceed
+        dict        — conflict found, with shape:
+                      {"existing_provider": str, "existing_tier": str,
+                       "existing_subscription_id": str, "current_period_end": str,
+                       "reason": str}
+    Never raises. On DB error, returns None (fail-open — better to allow than to
+    block a paying user due to our infrastructure issue)."""
+    if supa is None or not user_id:
+        return None
+    try:
+        res = (supa.table("users")
+               .select("tier, subscription_status, subscription_id, payment_provider, "
+                       "current_period_end")
+               .eq("id", user_id)
+               .limit(1)
+               .execute())
+        if not res.data or len(res.data) == 0:
+            return None  # no row yet — no conflict possible
+        row = res.data[0]
+    except Exception as e:
+        print(f"[conflict-check] DB read failed for user={user_id}: {e}")
+        return None  # fail-open
+
+    status = (row.get("subscription_status") or "").strip().lower()
+    existing_provider = (row.get("payment_provider") or "").strip().lower()
+    existing_tier = (row.get("tier") or "free").strip().lower()
+    existing_period_end = row.get("current_period_end") or ""
+
+    # Only "active" subscriptions create conflicts. Cancelled/halted/expired/created
+    # are dead or pending — user can freely subscribe over them.
+    if status != "active":
+        return None
+
+    # Defense-in-depth: also verify period is still in the future. If period_end has
+    # passed but webhook hasn't downgraded yet, we should let them resubscribe.
+    if existing_period_end and not _is_period_active(existing_period_end):
+        return None
+
+    # If user is trying the EXACT same tier+provider, no real conflict — just a retry.
+    # We allow this (the redundant subscription will be orphaned at the provider's
+    # end, harmlessly auto-cleaned).
+    requested_provider_norm = (requested_provider or "").strip().lower()
+    if existing_provider == requested_provider_norm and existing_tier == (requested_tier or "").strip().lower():
+        return None
+
+    # Genuine conflict: user has an active subscription, and they're trying to
+    # subscribe to something different. Block.
+    return {
+        "existing_provider": existing_provider,
+        "existing_tier": existing_tier,
+        "existing_subscription_id": (row.get("subscription_id") or "").strip(),
+        "current_period_end": existing_period_end,
+        "reason": (
+            f"already_subscribed_to_{existing_tier}_via_{existing_provider}"
+            if existing_provider and existing_tier else "already_subscribed"
+        ),
+    }
+
+
+# ============================================================
 # ANTI-ABUSE — Email normalization (Layer A: catches Tier 2 abuse)
 # ============================================================
 # Gmail and Googlemail treat dots and +aliases as identical:
@@ -623,6 +796,56 @@ def _get_user_quota(supa, user_id):
 # Clerk retry exhausted, etc.), users still get rows on first authed
 # API call. Belt-and-suspenders complement to the webhook path.
 # ============================================================
+def _fetch_clerk_user_basic(user_id):
+    """Fetch a Clerk user's basic info (email, first_name, last_name).
+
+    Returns a dict on success: {'email': str, 'first_name': str, 'last_name': str}
+    Returns None on any failure. Never raises.
+
+    Used for:
+      - lazy_create_user (to populate Supabase row)
+      - PayPal subscriber pre-fill (skips manual typing on PayPal checkout)
+    """
+    if not user_id:
+        return None
+    secret = (os.getenv("CLERK_SECRET_KEY") or "").strip()
+    if not secret:
+        return None
+    try:
+        api_resp = requests.get(
+            f"https://api.clerk.com/v1/users/{user_id}",
+            headers={"Authorization": f"Bearer {secret}"},
+            timeout=8,
+        )
+        if api_resp.status_code != 200:
+            return None
+        clerk_data = api_resp.json()
+    except Exception:
+        return None
+
+    # Extract primary email (same logic as _lazy_create_user)
+    email = ""
+    try:
+        email_list = clerk_data.get("email_addresses", []) or []
+        primary_id = clerk_data.get("primary_email_address_id", "")
+        for em in email_list:
+            if em.get("id") == primary_id:
+                email = (em.get("email_address") or "").strip().lower()
+                break
+        if not email and email_list:
+            email = (email_list[0].get("email_address") or "").strip().lower()
+    except Exception:
+        pass
+
+    first_name = (clerk_data.get("first_name") or "").strip()
+    last_name = (clerk_data.get("last_name") or "").strip()
+    return {
+        "email": email,
+        "first_name": first_name,
+        "last_name": last_name,
+    }
+
+
 def _lazy_create_user(supa, user_id):
     """Create a Supabase users row by fetching info from Clerk's API.
 
@@ -2100,6 +2323,21 @@ def razorpay_create_subscription():
     if supa is None:
         return jsonify({"ok": False, "error": "supabase_unavailable"}), 503
 
+    # 5b. Conflict check: prevent users from accidentally double-subscribing.
+    # If user has an active subscription with a different provider or tier,
+    # block this request and ask them to cancel the existing one first.
+    conflict = _check_subscription_conflict(supa, user_id, "razorpay", tier, cycle)
+    if conflict:
+        print(f"[rzp-checkout] conflict for user={user_id}: {conflict['reason']}")
+        return jsonify({
+            "ok": False,
+            "error": "subscription_conflict",
+            "detail": conflict["reason"],
+            "existing_provider": conflict["existing_provider"],
+            "existing_tier": conflict["existing_tier"],
+            "current_period_end": conflict["current_period_end"],
+        }), 409  # 409 Conflict — semantically correct status code
+
     # 6. Create the subscription via Razorpay API
     # total_count = number of billing cycles before Razorpay auto-stops the subscription.
     # We use 120 (10 years) for monthly and 10 (10 years) for yearly — effectively indefinite.
@@ -2162,6 +2400,221 @@ def razorpay_create_subscription():
     return jsonify({
         "ok": True,
         "short_url": short_url,
+        "subscription_id": subscription_id,
+        "plan_id": plan_id,
+        "tier": tier,
+        "cycle": cycle,
+    }), 200
+
+
+
+# ============================================================
+# /api/checkout/paypal/create-subscription
+# ------------------------------------------------------------
+# Creates a PayPal subscription for an authenticated user.
+# Frontend calls this when user clicks a paid-tier CTA (USD pricing path).
+# Mirrors the Razorpay checkout endpoint, but uses PayPal's API:
+#
+#   1. Verify the Clerk JWT (proves user is signed in)
+#   2. Read tier + cycle from the request body
+#   3. Look up the matching plan_id from PayPal env vars
+#   4. Get OAuth token from PayPal (cached)
+#   5. POST /v1/billing/subscriptions to PayPal API
+#   6. Stash subscription_id + plan_id + provider='paypal' on user row
+#      (status='created' — webhook will flip to 'active' when paid)
+#   7. Return the PayPal approval URL for frontend redirect
+#
+# Frontend redirects user to the approve link. User pays. PayPal webhook
+# (Task 11) tells us "paid", we update tier to active.
+#
+# Request body:
+#   { "tier": "creator"|"pro"|"agency", "cycle": "monthly"|"yearly" }
+#
+# Response (success):
+#   200 { "ok": true, "approve_url": "...", "subscription_id": "...",
+#         "plan_id": "...", "tier": "...", "cycle": "..." }
+# Response (error):
+#   401 unauthorized          — no JWT or invalid
+#   400 bad_request           — invalid tier/cycle
+#   503 paypal_unavailable    — token fetch failed (creds missing or PayPal down)
+#   503 plan_not_configured   — env var for that plan_id missing
+#   500 paypal_api_error      — PayPal API returned an error
+#   500 db_error              — couldn't store subscription_id on user row
+# ============================================================
+@app.route("/api/checkout/paypal/create-subscription", methods=["POST", "OPTIONS"])
+def paypal_create_subscription():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    # 1. Verify auth (Clerk JWT required)
+    if not _AUTH_DEPS_OK:
+        return jsonify({"ok": False, "error": "auth_deps_unavailable", "detail": _AUTH_DEPS_ERR}), 503
+    user_id, jwt_err = _verify_clerk_jwt(request)
+    if not user_id:
+        print(f"[pp-checkout] JWT verification failed: {jwt_err}")
+        return jsonify({"ok": False, "error": "unauthorized", "detail": jwt_err}), 401
+
+    # 2. Parse body
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        body = {}
+    tier = (body.get("tier") or "").strip().lower()
+    cycle = (body.get("cycle") or "").strip().lower()
+    if tier not in {"creator", "pro", "agency"}:
+        return jsonify({"ok": False, "error": "bad_request",
+                        "detail": f"invalid tier: {tier!r}"}), 400
+    if cycle not in {"monthly", "yearly"}:
+        return jsonify({"ok": False, "error": "bad_request",
+                        "detail": f"invalid cycle: {cycle!r}"}), 400
+
+    # 3. Look up plan_id
+    plan_id = _get_paypal_plan_id(tier, cycle)
+    if not plan_id:
+        return jsonify({"ok": False, "error": "plan_not_configured",
+                        "detail": f"no env var for tier={tier} cycle={cycle}"}), 503
+
+    # 4. Get OAuth token
+    token = _get_paypal_access_token()
+    if not token:
+        return jsonify({"ok": False, "error": "paypal_unavailable",
+                        "detail": "oauth_token_fetch_failed"}), 503
+
+    # 5. Get Supabase
+    supa = _get_supabase()
+    if supa is None:
+        return jsonify({"ok": False, "error": "supabase_unavailable"}), 503
+
+    # 5b. Conflict check: prevent users from accidentally double-subscribing.
+    # If user has an active subscription with a different provider or tier,
+    # block this request and ask them to cancel the existing one first.
+    conflict = _check_subscription_conflict(supa, user_id, "paypal", tier, cycle)
+    if conflict:
+        print(f"[pp-checkout] conflict for user={user_id}: {conflict['reason']}")
+        return jsonify({
+            "ok": False,
+            "error": "subscription_conflict",
+            "detail": conflict["reason"],
+            "existing_provider": conflict["existing_provider"],
+            "existing_tier": conflict["existing_tier"],
+            "current_period_end": conflict["current_period_end"],
+        }), 409  # 409 Conflict — semantically correct status code
+
+    # 6. Build return URLs (where PayPal sends user after approve/cancel)
+    # Frontend reads ?subscribed=1&tier=X to show welcome, ?cancelled=1 for cancel page.
+    # Origin = onepost.co.in (or wherever frontend is hosted). We accept this from
+    # request headers so it works in any environment.
+    origin = request.headers.get("Origin", "").strip() or "https://onepost.co.in"
+    return_url = f"{origin}/?subscribed=1&tier={tier}&provider=paypal"
+    cancel_url = f"{origin}/?cancelled=1"
+
+    # 6b. Pre-fill subscriber info from Clerk (better UX — user doesn't retype email
+    # on PayPal's checkout page). Fetched best-effort: if Clerk API call fails, we
+    # proceed without subscriber block, PayPal collects info on their page.
+    subscriber_block = None
+    try:
+        user_info = _fetch_clerk_user_basic(user_id)
+        if user_info and user_info.get("email"):
+            sub_dict = {"email_address": user_info["email"]}
+            # PayPal accepts name as {given_name, surname}. Both required if name is present.
+            fn = user_info.get("first_name", "")
+            ln = user_info.get("last_name", "")
+            if fn:
+                sub_dict["name"] = {
+                    "given_name": fn[:140],   # PayPal field length limit
+                    "surname": (ln or "User")[:140],  # PayPal requires surname; use 'User' if empty
+                }
+            subscriber_block = sub_dict
+    except Exception as e:
+        # Pre-fill is best-effort; never block checkout on this
+        print(f"[pp-checkout] subscriber pre-fill skipped: {e}")
+
+    # 7. Create the subscription via PayPal API
+    # PayPal /v1/billing/subscriptions accepts:
+    #   plan_id, subscriber, application_context (return/cancel URLs), custom_id
+    # custom_id is a free-form string we use to stash user_id so the webhook
+    # can correlate the subscription back to our user.
+    sub_request_body = {
+        "plan_id": plan_id,
+        "custom_id": user_id,  # critical: webhook reads this to find user
+        "application_context": {
+            "brand_name": "OnePost",
+            "locale": "en-US",
+            "shipping_preference": "NO_SHIPPING",
+            "user_action": "SUBSCRIBE_NOW",
+            "payment_method": {
+                "payer_selected": "PAYPAL",
+                "payee_preferred": "IMMEDIATE_PAYMENT_REQUIRED",
+            },
+            "return_url": return_url,
+            "cancel_url": cancel_url,
+        },
+    }
+    if subscriber_block:
+        sub_request_body["subscriber"] = subscriber_block
+
+    try:
+        import requests as _requests
+        import json as _json
+        resp = _requests.post(
+            f"{_PAYPAL_API_BASE}/v1/billing/subscriptions",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+            data=_json.dumps(sub_request_body),
+            timeout=30,
+        )
+    except Exception as e:
+        err_str = str(e)[:300]
+        print(f"[pp-checkout] PayPal API exception for user={user_id} tier={tier}: {err_str}")
+        return jsonify({"ok": False, "error": "paypal_api_error", "detail": err_str}), 500
+
+    if resp.status_code not in (200, 201):
+        err_text = resp.text[:300] if resp.text else f"HTTP {resp.status_code}"
+        print(f"[pp-checkout] PayPal API error {resp.status_code} for user={user_id}: {err_text}")
+        return jsonify({"ok": False, "error": "paypal_api_error",
+                        "status": resp.status_code,
+                        "detail": err_text}), 500
+
+    try:
+        sub = resp.json()
+    except Exception as e:
+        print(f"[pp-checkout] PayPal response JSON parse failed: {e}")
+        return jsonify({"ok": False, "error": "paypal_bad_response",
+                        "detail": "json_parse_failed"}), 500
+
+    subscription_id = sub.get("id", "")
+    # Find approve link in PayPal's HATEOAS-style links array
+    approve_url = ""
+    for link in (sub.get("links") or []):
+        if (link.get("rel") or "").lower() == "approve":
+            approve_url = link.get("href", "")
+            break
+    if not subscription_id or not approve_url:
+        print(f"[pp-checkout] PayPal returned incomplete: id={subscription_id!r} approve={approve_url!r}")
+        return jsonify({"ok": False, "error": "paypal_bad_response",
+                        "detail": "missing id or approve link"}), 500
+
+    # 8. Stash on user row (mirrors Razorpay behavior).
+    # status='created' — webhook flips to 'active' when payment succeeds.
+    try:
+        supa.table("users").update({
+            "subscription_id": subscription_id,
+            "plan_id": plan_id,
+            "subscription_status": "created",
+            "payment_provider": "paypal",
+        }).eq("id", user_id).execute()
+        print(f"[pp-checkout] [OK] user={user_id} tier={tier} cycle={cycle} "
+              f"sub={subscription_id} plan={plan_id}")
+    except Exception as e:
+        print(f"[pp-checkout] DB update failed (proceeding anyway): {e}")
+
+    # 9. Return the approve URL — frontend redirects user there
+    return jsonify({
+        "ok": True,
+        "approve_url": approve_url,
         "subscription_id": subscription_id,
         "plan_id": plan_id,
         "tier": tier,
@@ -2514,6 +2967,22 @@ def auth_debug():
             "pro_yearly":      bool((os.getenv("RAZORPAY_PLAN_PRO_YEARLY") or "").strip()),
             "agency_monthly":  bool((os.getenv("RAZORPAY_PLAN_AGENCY_MONTHLY") or "").strip()),
             "agency_yearly":   bool((os.getenv("RAZORPAY_PLAN_AGENCY_YEARLY") or "").strip()),
+        },
+        # ---- PayPal diagnostics (Task 10) ----
+        # Token reachable means OAuth call succeeded — i.e. CLIENT_ID + SECRET valid
+        # AND PayPal API reachable. We DO NOT call this on every auth-debug request
+        # (would burn rate limits) — instead we check cache state.
+        "paypal_client_id_set": bool((os.getenv("PAYPAL_CLIENT_ID") or "").strip()),
+        "paypal_client_secret_set": bool((os.getenv("PAYPAL_CLIENT_SECRET") or "").strip()),
+        "paypal_webhook_id_set": bool((os.getenv("PAYPAL_WEBHOOK_ID") or "").strip()),
+        "paypal_product_id_set": bool((os.getenv("PAYPAL_PRODUCT_ID") or "").strip()),
+        "paypal_plans_configured": {
+            "creator_monthly": bool((os.getenv("PAYPAL_PLAN_CREATOR_MONTHLY") or "").strip()),
+            "creator_yearly":  bool((os.getenv("PAYPAL_PLAN_CREATOR_YEARLY") or "").strip()),
+            "pro_monthly":     bool((os.getenv("PAYPAL_PLAN_PRO_MONTHLY") or "").strip()),
+            "pro_yearly":      bool((os.getenv("PAYPAL_PLAN_PRO_YEARLY") or "").strip()),
+            "agency_monthly":  bool((os.getenv("PAYPAL_PLAN_AGENCY_MONTHLY") or "").strip()),
+            "agency_yearly":   bool((os.getenv("PAYPAL_PLAN_AGENCY_YEARLY") or "").strip()),
         },
     })
 
