@@ -2930,6 +2930,382 @@ def razorpay_webhook():
 
 
 # ============================================================
+# /api/webhooks/paypal — receives subscription lifecycle events from PayPal
+# ------------------------------------------------------------
+# PayPal POSTs here on every subscription event. Mirrors Razorpay's webhook
+# in structure, but uses PayPal-specific:
+#   - Signature verification: API call to /v1/notifications/verify-webhook-signature
+#     (NOT HMAC like Razorpay — PayPal designed it this way; we have no choice).
+#   - Event field paths: event.resource.id (subscription_id), event.resource.custom_id
+#     (the user_id we stashed in Task 10), event.resource.plan_id.
+#   - Event names: BILLING.SUBSCRIPTION.ACTIVATED, PAYMENT.SALE.COMPLETED, etc.
+#
+# Same B-simple cancel-at-period-end pattern as Razorpay: cancel webhook just
+# sets subscription_status='cancelled' but leaves tier intact. Period-end
+# safety net (_is_period_active) auto-treats user as free after period_end.
+#
+# IDEMPOTENCY: Uses webhook_events table (PRIMARY KEY on event_id) — same
+# table as Razorpay, just with provider='paypal' to distinguish.
+#
+# EVENT HANDLING:
+#   BILLING.SUBSCRIPTION.ACTIVATED      → flip to paid tier, set period dates, monthly_used=0
+#   PAYMENT.SALE.COMPLETED              → renewal: roll period dates, reset monthly_used=0
+#   BILLING.SUBSCRIPTION.CANCELLED      → mark status='cancelled', tier preserved
+#   BILLING.SUBSCRIPTION.SUSPENDED      → status='paused', tier preserved (treat like cancel)
+#   BILLING.SUBSCRIPTION.EXPIRED        → downgrade to free
+#   BILLING.SUBSCRIPTION.PAYMENT.FAILED → log, no tier change (auto-downgrade only on SUSPENDED/EXPIRED)
+#
+# Always returns 200 so PayPal doesn't retry. Errors logged loud.
+# ============================================================
+
+def _verify_paypal_webhook(headers, body_str, webhook_id, access_token):
+    """Verify PayPal webhook signature via PayPal's API.
+    PayPal doesn't use HMAC — instead we POST the headers + body to their
+    /v1/notifications/verify-webhook-signature endpoint and they return
+    {verification_status: 'SUCCESS' | 'FAILURE'}.
+
+    Args:
+        headers: dict-like (request.headers) — PayPal sends auth_algo, transmission_id,
+                 transmission_time, transmission_sig, cert_url
+        body_str: raw request body as a string (must match exactly what PayPal sent)
+        webhook_id: from PAYPAL_WEBHOOK_ID env var (created in PayPal dashboard)
+        access_token: from _get_paypal_access_token()
+
+    Returns True on verified, False on failure or any error. Never raises.
+    """
+    if not webhook_id or not access_token:
+        return False
+    try:
+        import requests as _requests
+        import json as _json
+        # Required headers from PayPal — case-insensitive lookup
+        def _h(name):
+            return headers.get(name) or headers.get(name.lower()) or headers.get(name.title()) or ""
+        verify_payload = {
+            "auth_algo": _h("PAYPAL-AUTH-ALGO"),
+            "cert_url": _h("PAYPAL-CERT-URL"),
+            "transmission_id": _h("PAYPAL-TRANSMISSION-ID"),
+            "transmission_sig": _h("PAYPAL-TRANSMISSION-SIG"),
+            "transmission_time": _h("PAYPAL-TRANSMISSION-TIME"),
+            "webhook_id": webhook_id,
+            # webhook_event must be the parsed JSON object, not the raw string
+            "webhook_event": _json.loads(body_str) if body_str else {},
+        }
+        # If any required header is missing, fail closed
+        for k in ("auth_algo", "cert_url", "transmission_id", "transmission_sig", "transmission_time"):
+            if not verify_payload[k]:
+                print(f"[pp-webhook] verify: missing required header {k}")
+                return False
+
+        resp = _requests.post(
+            f"{_PAYPAL_API_BASE}/v1/notifications/verify-webhook-signature",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            data=_json.dumps(verify_payload),
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"[pp-webhook] verify API returned {resp.status_code}: {resp.text[:200]}")
+            return False
+        result = resp.json()
+        status = (result.get("verification_status") or "").strip().upper()
+        if status != "SUCCESS":
+            print(f"[pp-webhook] verification_status={status}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[pp-webhook] verify exception: {e}")
+        return False
+
+
+def _paypal_iso_now():
+    """ISO timestamp for the current UTC moment."""
+    return _now_utc().isoformat()
+
+
+@app.route("/api/webhooks/paypal", methods=["POST", "OPTIONS"])
+def paypal_webhook():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    # 1. Get config — webhook_id needed for verification
+    webhook_id = (os.getenv("PAYPAL_WEBHOOK_ID") or "").strip()
+    if not webhook_id:
+        print("[pp-webhook] PAYPAL_WEBHOOK_ID not configured")
+        return jsonify({"ok": False, "error": "webhook_not_configured"}), 503
+
+    # 2. Get raw body (string for signature verification, must be byte-for-byte
+    # what PayPal sent. We read once and reuse.)
+    raw_body = request.get_data(as_text=True)
+
+    # 3. Get OAuth access token (needed for signature verification API call)
+    access_token = _get_paypal_access_token()
+    if not access_token:
+        print("[pp-webhook] could not get PayPal access token for verification")
+        # Return 500 so PayPal retries — token issue may be transient
+        return jsonify({"ok": False, "error": "paypal_token_unavailable"}), 500
+
+    # 4. Verify signature via PayPal API
+    if not _verify_paypal_webhook(request.headers, raw_body, webhook_id, access_token):
+        print(f"[pp-webhook] signature verification FAILED")
+        return jsonify({"ok": False, "error": "bad_signature"}), 401
+
+    # 5. Parse JSON payload (safe — already verified)
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+    except Exception as e:
+        print(f"[pp-webhook] JSON parse error: {e}")
+        return jsonify({"ok": False, "error": "bad_json"}), 400
+
+    event_type = payload.get("event_type", "")
+    event_id = payload.get("id", "")  # PayPal puts event id at top level
+
+    if not event_id:
+        # Fallback: synthesize an id from event_type + create_time
+        ct = payload.get("create_time", "")
+        event_id = f"synth_{event_type}_{ct}"
+        print(f"[pp-webhook] WARN: payload missing id, using synth: {event_id}")
+
+    print(f"[pp-webhook] received event={event_type} id={event_id}")
+
+    # 6. Get Supabase
+    supa = _get_supabase()
+    if supa is None:
+        print("[pp-webhook] Supabase unavailable — returning 500 for retry")
+        return jsonify({"ok": False, "error": "supabase_unavailable"}), 500
+
+    # 7. Idempotency: insert into webhook_events. Duplicate delivery throws.
+    try:
+        supa.table("webhook_events").insert({
+            "event_id": event_id,
+            "provider": "paypal",
+            "event_type": event_type,
+            "payload": payload,
+            "status": "received",
+        }).execute()
+    except Exception as ins_err:
+        err_str = str(ins_err)
+        if "duplicate key" in err_str.lower() or "23505" in err_str:
+            print(f"[pp-webhook] duplicate event {event_id} — already processed")
+            return jsonify({"ok": True, "duplicate": True, "event_id": event_id}), 200
+        print(f"[pp-webhook] webhook_events insert failed: {err_str[:200]}")
+        return jsonify({"ok": False, "error": "db_insert_failed"}), 500
+
+    # 8. Extract subscription details from PayPal's payload structure.
+    # PayPal puts the subscription object at payload.resource.
+    # Key fields:
+    #   resource.id            → PayPal subscription_id (e.g. I-XXXX or BILL-XXXX)
+    #   resource.plan_id       → PayPal plan_id
+    #   resource.custom_id     → user_id we stashed in Task 10
+    #   resource.status        → ACTIVE | CANCELLED | SUSPENDED | EXPIRED
+    #   resource.billing_info.next_billing_time → ISO datetime, our period_end
+    #   resource.billing_info.last_payment.time → ISO datetime, our period_start
+    #   resource.start_time    → original subscription start (used as period_start fallback)
+    #
+    # For PAYMENT.SALE.COMPLETED, the resource is a Payment object instead:
+    #   resource.billing_agreement_id → the subscription_id this payment is for
+    #   resource.create_time          → payment timestamp
+    resource = payload.get("resource", {}) or {}
+
+    # Identify the subscription_id and find the user
+    # For BILLING.SUBSCRIPTION.* events: subscription_id = resource.id
+    # For PAYMENT.SALE.COMPLETED: subscription_id = resource.billing_agreement_id
+    if event_type.startswith("BILLING.SUBSCRIPTION"):
+        subscription_id = resource.get("id", "")
+        plan_id = resource.get("plan_id", "")
+        user_id = resource.get("custom_id", "")
+    elif event_type == "PAYMENT.SALE.COMPLETED":
+        subscription_id = resource.get("billing_agreement_id", "")
+        plan_id = ""  # not directly available — we'll look up via DB
+        user_id = ""  # not in payment payload — we'll look up via DB
+    else:
+        subscription_id = resource.get("id", "")
+        plan_id = resource.get("plan_id", "")
+        user_id = resource.get("custom_id", "")
+
+    # If user_id wasn't in payload, look it up via subscription_id in our DB
+    if not user_id and subscription_id:
+        try:
+            res = (supa.table("users")
+                   .select("id")
+                   .eq("subscription_id", subscription_id)
+                   .limit(1)
+                   .execute())
+            if res.data and len(res.data) > 0:
+                user_id = res.data[0]["id"]
+        except Exception as e:
+            print(f"[pp-webhook] user_id lookup by sub_id failed: {e}")
+
+    if not user_id:
+        # Can't proceed — log and accept (PayPal won't retry on 200)
+        print(f"[pp-webhook] WARN: no user_id resolvable for event={event_type} sub={subscription_id}")
+        try:
+            supa.table("webhook_events").update({
+                "status": "failed",
+                "processed_at": _paypal_iso_now(),
+            }).eq("event_id", event_id).execute()
+        except Exception:
+            pass
+        return jsonify({"ok": True, "skipped": True, "reason": "no_user_id_resolvable"}), 200
+
+    # Extract period dates if available (BILLING.SUBSCRIPTION events have these)
+    billing_info = resource.get("billing_info", {}) or {}
+    last_payment = billing_info.get("last_payment", {}) or {}
+    period_start = last_payment.get("time", "") or resource.get("start_time", "")
+    period_end = billing_info.get("next_billing_time", "")
+
+    # 9. Branch on event type
+    update_fields = None
+    extra_log = ""
+
+    if event_type == "BILLING.SUBSCRIPTION.ACTIVATED":
+        # First-time activation: flip to paid tier, set period dates, reset counters
+        tier, cycle = _paypal_tier_from_plan_id(plan_id)
+        if not tier:
+            print(f"[pp-webhook] WARN: unknown plan_id {plan_id} on activation")
+            update_fields = {
+                "subscription_status": "active",
+                "subscription_id": subscription_id,
+                "plan_id": plan_id,
+                "payment_provider": "paypal",
+            }
+        else:
+            update_fields = {
+                "tier": tier,
+                "subscription_status": "active",
+                "subscription_id": subscription_id,
+                "plan_id": plan_id,
+                "payment_provider": "paypal",
+                "current_period_start": period_start or _paypal_iso_now(),
+                "current_period_end": period_end or "",
+                "monthly_used": 0,
+            }
+            extra_log = f"tier={tier} cycle={cycle}"
+
+    elif event_type == "PAYMENT.SALE.COMPLETED":
+        # Renewal payment succeeded — roll period dates, reset monthly_used.
+        # PayPal's PAYMENT.SALE.COMPLETED resource doesn't include period_end.
+        # We calculate it ourselves: period_end = period_start + 1 month / 1 year
+        # (depending on cycle, which we infer from the user's plan_id in DB).
+        # This matches Stripe/Razorpay/standard SaaS behavior — no extra API hop needed.
+        update_fields = {
+            "subscription_status": "active",
+            "monthly_used": 0,
+        }
+        # period_start = the payment time (when this billing cycle began)
+        payment_time = resource.get("create_time", "")
+        if payment_time:
+            update_fields["current_period_start"] = payment_time
+
+        # Fetch the user's plan_id from DB so we can determine cycle (monthly/yearly)
+        # and compute the new period_end. If lookup fails, leave period_end as-is —
+        # the period-end safety net might prematurely expire them, but better that
+        # than a stale "infinite" period.
+        try:
+            from datetime import datetime, timezone, timedelta
+            # Re-fetch user's plan_id (the one we set when subscription was created)
+            user_row = (supa.table("users")
+                        .select("plan_id")
+                        .eq("id", user_id)
+                        .limit(1)
+                        .execute())
+            if user_row.data and len(user_row.data) > 0:
+                stored_plan_id = (user_row.data[0].get("plan_id") or "").strip()
+                _tier, cycle = _paypal_tier_from_plan_id(stored_plan_id)
+                if cycle and payment_time:
+                    # Parse payment_time (PayPal sends ISO 8601 with Z suffix)
+                    pt_str = payment_time.replace("Z", "+00:00")
+                    pt_dt = datetime.fromisoformat(pt_str)
+                    # Calculate period_end = period_start + cycle duration.
+                    # 30 days for monthly (close enough for SaaS — exact PayPal handling
+                    # uses calendar months, but date math is unambiguous & safe).
+                    if cycle == "monthly":
+                        new_period_end = pt_dt + timedelta(days=30)
+                    else:  # yearly
+                        new_period_end = pt_dt + timedelta(days=365)
+                    update_fields["current_period_end"] = new_period_end.isoformat()
+        except Exception as e:
+            print(f"[pp-webhook] period_end calculation skipped: {e}")
+        extra_log = "renewal payment"
+
+    elif event_type == "BILLING.SUBSCRIPTION.CANCELLED":
+        # User cancelled. B-simple flavor: status='cancelled', tier preserved.
+        # _is_period_active() safety net auto-treats them as free after period_end.
+        update_fields = {
+            "subscription_status": "cancelled",
+        }
+        extra_log = "cancelled, tier preserved until period_end"
+
+    elif event_type == "BILLING.SUBSCRIPTION.SUSPENDED":
+        # PayPal "suspended" = paused. Treat like cancel (preserve tier until period_end).
+        update_fields = {
+            "subscription_status": "paused",
+        }
+        extra_log = "suspended, tier preserved until period_end"
+
+    elif event_type == "BILLING.SUBSCRIPTION.EXPIRED":
+        # Subscription naturally ended (PayPal-side). Downgrade to free.
+        update_fields = {
+            "tier": "free",
+            "subscription_status": "expired",
+            "current_period_end": None,
+        }
+        extra_log = "expired, downgraded to free"
+
+    elif event_type == "BILLING.SUBSCRIPTION.PAYMENT.FAILED":
+        # Payment failed but subscription not yet suspended. Log only — don't
+        # downgrade yet. PayPal will retry; if all retries fail, SUSPENDED fires
+        # which we handle separately. For now, just record the failure.
+        update_fields = None
+        extra_log = "payment_failed (no tier change yet)"
+        print(f"[pp-webhook] payment_failed user={user_id} sub={subscription_id} (not downgrading — will await SUSPENDED if persistent)")
+
+    else:
+        # Unknown event — accept but no-op
+        print(f"[pp-webhook] ignoring unknown event_type={event_type}")
+        try:
+            supa.table("webhook_events").update({
+                "status": "skipped",
+                "processed_at": _paypal_iso_now(),
+            }).eq("event_id", event_id).execute()
+        except Exception:
+            pass
+        return jsonify({"ok": True, "ignored": True, "event_type": event_type}), 200
+
+    # 10. Apply DB update if any
+    if update_fields is not None:
+        try:
+            supa.table("users").update(update_fields).eq("id", user_id).execute()
+            print(f"[pp-webhook] [OK] event={event_type} user={user_id} sub={subscription_id} {extra_log}")
+        except Exception as e:
+            err_str = str(e)[:200]
+            print(f"[pp-webhook] DB update failed for user={user_id}: {err_str}")
+            try:
+                supa.table("webhook_events").update({
+                    "status": "failed",
+                    "processed_at": _paypal_iso_now(),
+                }).eq("event_id", event_id).execute()
+            except Exception:
+                pass
+            return jsonify({"ok": False, "error": "db_update_failed", "detail": err_str}), 500
+
+    # 11. Mark webhook_events row as processed
+    try:
+        supa.table("webhook_events").update({
+            "status": "processed",
+            "user_id": user_id,
+            "processed_at": _paypal_iso_now(),
+        }).eq("event_id", event_id).execute()
+    except Exception as e:
+        print(f"[pp-webhook] webhook_events status update failed (non-blocking): {e}")
+
+    return jsonify({"ok": True, "event_type": event_type, "user_id": user_id}), 200
+
+
+
+# ============================================================
 # /api/auth-debug — diagnostic endpoint, safe to call anytime.
 # Reports whether auth deps + Razorpay are configured correctly.
 # Does NOT expose any secrets — only their PRESENCE/ABSENCE.
