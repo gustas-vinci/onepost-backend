@@ -2622,6 +2622,301 @@ def paypal_create_subscription():
     }), 200
 
 
+# ============================================================
+# /api/me/subscription  (GET)  — My Account: read subscription state
+# ------------------------------------------------------------
+# Returns a complete picture of the user's subscription for the
+# "My Account" modal. Authenticated only.
+#
+# Free users get a clean { tier: "free", subscription_status: null, ... }
+# response (200, not 404) — frontend renders "You're on the Free plan".
+#
+# For paid users, returns provider/id/plan/period info plus a derived
+# `cycle` (monthly|yearly) reverse-looked-up from plan_id, and a
+# `is_period_active` boolean computed via _is_period_active() so the
+# frontend can render "Active until ..." vs "Expired" without re-parsing
+# timestamps in JS.
+# ============================================================
+@app.route("/api/me/subscription", methods=["GET", "OPTIONS"])
+def me_subscription():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    # 1. Auth (Clerk JWT required)
+    if not _AUTH_DEPS_OK:
+        return jsonify({"ok": False, "error": "auth_deps_unavailable",
+                        "detail": _AUTH_DEPS_ERR}), 503
+    user_id, jwt_err = _verify_clerk_jwt(request)
+    if not user_id:
+        return jsonify({"ok": False, "error": "unauthorized",
+                        "detail": jwt_err}), 401
+
+    # 2. Read user row
+    supa = _get_supabase()
+    if supa is None:
+        return jsonify({"ok": False, "error": "supabase_unavailable"}), 503
+
+    try:
+        res = (supa.table("users")
+               .select("email, tier, subscription_status, subscription_id, "
+                       "plan_id, payment_provider, current_period_start, "
+                       "current_period_end, monthly_used")
+               .eq("id", user_id)
+               .limit(1)
+               .execute())
+        if not res.data or len(res.data) == 0:
+            # No row yet — treat as free user (lazy-create happens on quota fetch).
+            return jsonify({
+                "ok": True,
+                "tier": "free",
+                "subscription_status": None,
+                "subscription_id": None,
+                "plan_id": None,
+                "payment_provider": None,
+                "cycle": None,
+                "current_period_start": None,
+                "current_period_end": None,
+                "is_period_active": False,
+                "monthly_used": 0,
+                "monthly_limit": 0,
+                "email": None,
+            }), 200
+        row = res.data[0]
+    except Exception as e:
+        print(f"[me-sub] DB read failed for user={user_id}: {e}")
+        return jsonify({"ok": False, "error": "db_read_failed",
+                        "detail": str(e)[:120]}), 503
+
+    tier = (row.get("tier") or "free").strip().lower()
+    provider = (row.get("payment_provider") or "").strip().lower() or None
+    plan_id = (row.get("plan_id") or "").strip() or None
+    status = (row.get("subscription_status") or "").strip().lower() or None
+    period_end = row.get("current_period_end") or None
+
+    # Derive cycle from plan_id (reverse-lookup against env vars)
+    cycle = None
+    if plan_id and provider == "razorpay":
+        _t, _c = _tier_from_plan_id(plan_id)
+        cycle = _c or None
+    elif plan_id and provider == "paypal":
+        _t, _c = _paypal_tier_from_plan_id(plan_id)
+        cycle = _c or None
+
+    # Derive monthly_limit from tier (same source of truth as quota path)
+    tier_limits = _get_tier_limits(tier)
+    monthly_limit = int(tier_limits.get("monthly") or 0)
+
+    return jsonify({
+        "ok": True,
+        "tier": tier,
+        "subscription_status": status,
+        "subscription_id": (row.get("subscription_id") or "").strip() or None,
+        "plan_id": plan_id,
+        "payment_provider": provider,
+        "cycle": cycle,
+        "current_period_start": row.get("current_period_start") or None,
+        "current_period_end": period_end,
+        "is_period_active": _is_period_active(period_end),
+        "monthly_used": int(row.get("monthly_used") or 0),
+        "monthly_limit": monthly_limit,
+        "email": (row.get("email") or "").strip() or None,
+    }), 200
+
+
+# ============================================================
+# /api/me/cancel-subscription  (POST)  — My Account: self-service cancel
+# ------------------------------------------------------------
+# This is the fix for Bug 1 (UPI Autopay cancellation doesn't propagate).
+# Calls the payment provider's cancel API directly, which triggers their
+# webhook to fire to us, which updates our DB via the existing handlers.
+#
+# BEHAVIOR (B-simple cancel-at-period-end):
+#   - Razorpay: rzp.subscription.cancel(sub_id, {cancel_at_cycle_end: 0})
+#     → cancels immediately at Razorpay → subscription.cancelled webhook
+#     → DB row gets status='cancelled', tier preserved until period_end
+#   - PayPal: POST /v1/billing/subscriptions/{id}/cancel
+#     → cancels at PayPal → BILLING.SUBSCRIPTION.CANCELLED webhook
+#     → DB row gets status='cancelled', tier preserved until period_end
+#
+# Defense-in-depth: we also write status='cancelled' to the DB right
+# after a successful provider-side cancel, so the user sees instant UI
+# feedback even before the webhook arrives. The webhook is idempotent
+# (uses event_id PRIMARY KEY in webhook_events table), so this double-
+# write is safe — when the webhook fires it'll either find the row
+# already correct (no-op effectively) or correct any drift.
+#
+# IDEMPOTENCY:
+#   - If user is already 'cancelled' / 'halted' / 'expired': return 200
+#     with a friendly message rather than calling the provider again
+#     (calling cancel on an already-cancelled sub at Razorpay returns
+#     error; PayPal returns 422). Frontend can just refresh.
+#   - If user is 'free' with no subscription_id: return 404.
+#
+# AUTH: Clerk JWT required (user can only cancel their own sub).
+# ============================================================
+@app.route("/api/me/cancel-subscription", methods=["POST", "OPTIONS"])
+def me_cancel_subscription():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    # 1. Auth
+    if not _AUTH_DEPS_OK:
+        return jsonify({"ok": False, "error": "auth_deps_unavailable",
+                        "detail": _AUTH_DEPS_ERR}), 503
+    user_id, jwt_err = _verify_clerk_jwt(request)
+    if not user_id:
+        return jsonify({"ok": False, "error": "unauthorized",
+                        "detail": jwt_err}), 401
+
+    # 2. Read user's subscription state
+    supa = _get_supabase()
+    if supa is None:
+        return jsonify({"ok": False, "error": "supabase_unavailable"}), 503
+
+    try:
+        res = (supa.table("users")
+               .select("tier, subscription_status, subscription_id, "
+                       "payment_provider, current_period_end")
+               .eq("id", user_id)
+               .limit(1)
+               .execute())
+        row = res.data[0] if res.data and len(res.data) > 0 else None
+    except Exception as e:
+        print(f"[me-cancel] DB read failed for user={user_id}: {e}")
+        return jsonify({"ok": False, "error": "db_read_failed",
+                        "detail": str(e)[:120]}), 503
+
+    if not row:
+        return jsonify({"ok": False, "error": "no_subscription",
+                        "detail": "No active subscription found."}), 404
+
+    status = (row.get("subscription_status") or "").strip().lower()
+    provider = (row.get("payment_provider") or "").strip().lower()
+    sub_id = (row.get("subscription_id") or "").strip()
+    period_end = row.get("current_period_end") or None
+
+    # 3. Idempotency: nothing to cancel
+    if not sub_id or not provider:
+        return jsonify({"ok": False, "error": "no_subscription",
+                        "detail": "No active subscription found."}), 404
+
+    # Already cancelled/halted/expired — friendly no-op.
+    # We treat these as "already done" to keep retries safe.
+    if status in {"cancelled", "halted", "expired"}:
+        print(f"[me-cancel] user={user_id} sub={sub_id} already in terminal "
+              f"status={status} — no-op")
+        return jsonify({
+            "ok": True,
+            "already_cancelled": True,
+            "provider": provider,
+            "subscription_id": sub_id,
+            "current_period_end": period_end,
+            "subscription_status": status,
+            "message": "Your subscription is already cancelled.",
+        }), 200
+
+    # 4. Call the provider's cancel API
+    if provider == "razorpay":
+        rzp = _get_razorpay()
+        if rzp is None:
+            return jsonify({"ok": False, "error": "razorpay_unavailable",
+                            "detail": _RAZORPAY_DEPS_ERR or "client_init_failed"}), 503
+        try:
+            # cancel_at_cycle_end=0 means "cancel now at Razorpay side"
+            # (no more renewal attempts). User's tier is preserved on OUR side
+            # via _is_period_active() safety net until current_period_end.
+            rzp.subscription.cancel(sub_id, {"cancel_at_cycle_end": 0})
+            print(f"[me-cancel] razorpay cancel OK: user={user_id} sub={sub_id}")
+        except Exception as e:
+            err_str = str(e)[:200]
+            print(f"[me-cancel] razorpay cancel FAILED: user={user_id} "
+                  f"sub={sub_id} err={err_str}")
+            # If Razorpay says the subscription is already in a terminal state
+            # (cancelled/completed/halted), accept that — our DB is just out of
+            # date. The webhook should arrive shortly to sync us.
+            err_lower = err_str.lower()
+            if ("already" in err_lower) or ("status" in err_lower and
+                                            ("cancelled" in err_lower or
+                                             "completed" in err_lower or
+                                             "halted" in err_lower)):
+                print(f"[me-cancel] razorpay reports already-terminal — "
+                      f"proceeding with DB defense-in-depth update")
+                # Fall through to DB update below
+            else:
+                return jsonify({"ok": False, "error": "razorpay_cancel_failed",
+                                "detail": err_str}), 502
+
+    elif provider == "paypal":
+        access_token = _get_paypal_access_token()
+        if not access_token:
+            return jsonify({"ok": False, "error": "paypal_unavailable",
+                            "detail": "could not obtain OAuth token"}), 503
+        try:
+            import requests as _requests
+            resp = _requests.post(
+                f"{_PAYPAL_API_BASE}/v1/billing/subscriptions/{sub_id}/cancel",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json={"reason": "User requested cancellation via OnePost "
+                                "account page"},
+                timeout=20,
+            )
+            # PayPal returns 204 No Content on success.
+            if resp.status_code == 204:
+                print(f"[me-cancel] paypal cancel OK: user={user_id} "
+                      f"sub={sub_id}")
+            elif resp.status_code == 422:
+                # 422 Unprocessable Entity — sub is already in a terminal
+                # state (cancelled / expired). Accept it.
+                print(f"[me-cancel] paypal sub already terminal "
+                      f"(HTTP 422): user={user_id} sub={sub_id}")
+                # Fall through to DB update
+            else:
+                err_body = resp.text[:300] if resp.text else ""
+                print(f"[me-cancel] paypal cancel FAILED: user={user_id} "
+                      f"sub={sub_id} HTTP={resp.status_code} body={err_body}")
+                return jsonify({"ok": False, "error": "paypal_cancel_failed",
+                                "detail": f"HTTP {resp.status_code}: "
+                                          f"{err_body[:120]}"}), 502
+        except Exception as e:
+            print(f"[me-cancel] paypal cancel exception: user={user_id} "
+                  f"sub={sub_id} err={e}")
+            return jsonify({"ok": False, "error": "paypal_cancel_failed",
+                            "detail": str(e)[:120]}), 502
+
+    else:
+        return jsonify({"ok": False, "error": "unknown_provider",
+                        "detail": f"unsupported payment_provider: "
+                                  f"{provider!r}"}), 400
+
+    # 5. Defense-in-depth: write status='cancelled' to DB immediately.
+    # The webhook will (idempotently) write the same value when it arrives.
+    # Tier is preserved per B-simple pattern — _is_period_active() handles
+    # the eventual downgrade when period_end passes.
+    try:
+        supa.table("users").update({
+            "subscription_status": "cancelled",
+        }).eq("id", user_id).execute()
+        print(f"[me-cancel] DB defense-in-depth update applied: user={user_id}")
+    except Exception as e:
+        # Provider-side cancel already succeeded — webhook will sync DB.
+        # Log and proceed; don't fail the request.
+        print(f"[me-cancel] DB defense-in-depth update failed (webhook will "
+              f"sync): user={user_id} err={e}")
+
+    return jsonify({
+        "ok": True,
+        "provider": provider,
+        "subscription_id": sub_id,
+        "current_period_end": period_end,
+        "subscription_status": "cancelled",
+        "message": ("Subscription cancelled. You'll keep access until "
+                    "the end of your current billing period."),
+    }), 200
+
 
 # ============================================================
 # /api/webhooks/razorpay — receives subscription lifecycle events
@@ -3359,6 +3654,12 @@ def auth_debug():
             "pro_yearly":      bool((os.getenv("PAYPAL_PLAN_PRO_YEARLY") or "").strip()),
             "agency_monthly":  bool((os.getenv("PAYPAL_PLAN_AGENCY_MONTHLY") or "").strip()),
             "agency_yearly":   bool((os.getenv("PAYPAL_PLAN_AGENCY_YEARLY") or "").strip()),
+        },
+        # ---- Task 14: My Account self-service cancel ----
+        # Presence of these flags simply confirms the new code is deployed.
+        "task_14_endpoints_deployed": {
+            "me_subscription_get":     True,
+            "me_cancel_subscription":  True,
         },
     })
 
