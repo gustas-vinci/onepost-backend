@@ -442,6 +442,121 @@ def _defensive_cancel_existing(supa, user_id):
 
 
 # ============================================================
+# WEBHOOK STALENESS CHECK — CME-1 race condition fix
+# ------------------------------------------------------------
+# Background: webhook handlers used to apply DB updates by matching only
+# eq("id", user_id). When a user switched providers or resumed/switched
+# plans, an OLD subscription's delayed webhook could arrive AFTER the
+# NEW subscription was already active, and silently clobber the new
+# sub's metadata. Self-healed on next webhook for the new sub, but
+# user-visible state was wrong for seconds-to-minutes.
+#
+# This helper centralizes the "should we apply this webhook?" decision
+# so both providers' handlers stay consistent.
+#
+# Returns: (should_apply: bool, reason: str)
+#   reason is used both for logging AND as the webhook_events.status value
+#   when we choose to skip ("ignored_stale_sub", "ignored_stale_active",
+#   "applied_no_match_warned" for the NULL sub_id case).
+#
+# Rules (decided in product session 2026-05-11):
+#   1. If row.subscription_id matches incoming sub_id → APPLY (normal case).
+#   2. If row.subscription_id is NULL/empty → APPLY but log warning.
+#   3. If mismatch AND event is ACTIVATED AND row.status != 'active' →
+#      APPLY (broader rule: a freshly-paid sub wins over any non-active
+#      stale state). This lets users complete a switch in one shot.
+#   4. If mismatch AND event is ACTIVATED AND row.status == 'active' →
+#      SKIP (stale activation collision; row already activated on a
+#      newer/different sub, don't downgrade it).
+#   5. If mismatch AND event is NOT activation (cancelled/charged/halted/
+#      paused/etc.) → SKIP (this is the CME-1 race we're fixing).
+#
+# Never raises. On DB read failure, fails OPEN (returns apply=True) so we
+# don't block legitimate webhooks because of an infrastructure issue.
+# ============================================================
+def _should_apply_webhook(supa, user_id, incoming_sub_id, is_activation):
+    """Determine whether a webhook should be applied to the user row.
+
+    Args:
+        supa: Supabase client
+        user_id: str, the user_id from webhook payload
+        incoming_sub_id: str, the subscription_id from the webhook event
+        is_activation: bool, True if this is an ACTIVATED event (Razorpay
+                       subscription.activated OR PayPal
+                       BILLING.SUBSCRIPTION.ACTIVATED)
+
+    Returns:
+        (should_apply: bool, reason: str)
+    """
+    if not user_id:
+        # No user_id (shouldn't happen — caller checks this first too).
+        # Fail-open: caller will fall through to existing error path.
+        return True, "no_user_id_fail_open"
+
+    if not incoming_sub_id:
+        # No sub_id in event (shouldn't happen for normal webhooks).
+        # Fail-open and let the existing handler decide.
+        return True, "no_incoming_sub_id_fail_open"
+
+    # Read the current row state. Single query, only the fields we need.
+    try:
+        res = (supa.table("users")
+               .select("subscription_id, subscription_status")
+               .eq("id", user_id)
+               .limit(1)
+               .execute())
+        if not res.data or len(res.data) == 0:
+            # No row for this user_id. Fail-open: lazy-creation path elsewhere
+            # may resolve this. The downstream UPDATE will be a no-op anyway.
+            print(f"[stale-check] no user row for user={user_id} — applying anyway")
+            return True, "applied_no_user_row"
+        row = res.data[0]
+    except Exception as e:
+        # DB read failed. Fail-open: don't block a legit webhook for an
+        # infra blip. The existing UPDATE will retry on its own connection.
+        print(f"[stale-check] DB read failed user={user_id}: {e} — applying anyway")
+        return True, "applied_db_read_failed"
+
+    existing_sub_id = (row.get("subscription_id") or "").strip()
+    existing_status = (row.get("subscription_status") or "").strip().lower()
+
+    # Rule 2: row has no sub_id yet.
+    if not existing_sub_id:
+        print(f"[stale-check] WARNING user={user_id} has no subscription_id "
+              f"on row; applying webhook for sub={incoming_sub_id} anyway "
+              f"(possible orphan or pre-checkout state)")
+        return True, "applied_no_match_warned"
+
+    # Rule 1: sub_id matches — happy path.
+    if existing_sub_id == incoming_sub_id:
+        return True, "applied"
+
+    # Mismatch territory — incoming event references a sub that's NOT the
+    # one currently on the user's row.
+    if is_activation:
+        # Rule 3: activation wins UNLESS row is already active on a different sub.
+        if existing_status == "active":
+            # Rule 4: stale activation arrived for an old sub while a newer
+            # sub is already active. Don't downgrade.
+            print(f"[stale-check] SKIP stale activation for user={user_id}: "
+                  f"incoming sub={incoming_sub_id} but row is already active "
+                  f"on sub={existing_sub_id}")
+            return False, "ignored_stale_active"
+        # Rule 3 applies: row is created/cancelled/paused/halted/expired/etc.
+        # — let the new activation overwrite.
+        print(f"[stale-check] APPLY activation for user={user_id}: "
+              f"row was {existing_status!r} on sub={existing_sub_id}, "
+              f"new activation for sub={incoming_sub_id} takes precedence")
+        return True, "applied_activation_overrides"
+
+    # Rule 5: non-activation event for a stale sub. This is the CME-1 race.
+    print(f"[stale-check] SKIP stale webhook for user={user_id}: "
+          f"incoming sub={incoming_sub_id} != row sub={existing_sub_id} "
+          f"(row status={existing_status!r})")
+    return False, "ignored_stale_sub"
+
+
+# ============================================================
 # ANTI-ABUSE — Email normalization (Layer A: catches Tier 2 abuse)
 # ============================================================
 # Gmail and Googlemail treat dots and +aliases as identical:
@@ -3357,9 +3472,33 @@ def razorpay_webhook():
 
     # 9. Apply the update (if any)
     if update_fields is not None:
+        # CME-1 fix: check whether this webhook is for the user's CURRENT
+        # subscription before clobbering their row. Stale webhooks for old
+        # subs (e.g. delayed cancel for sub_OLD after user moved to sub_NEW)
+        # would otherwise overwrite the new sub's metadata.
+        is_activation = (event_type == "subscription.activated")
+        should_apply, stale_reason = _should_apply_webhook(
+            supa, user_id, subscription_id, is_activation
+        )
+        if not should_apply:
+            # Webhook is stale — record audit trail and accept (200) so
+            # Razorpay doesn't retry. The actual user state is unchanged.
+            try:
+                supa.table("webhook_events").update({
+                    "status": stale_reason,
+                    "user_id": user_id,
+                    "processed_at": _now_utc().isoformat(),
+                }).eq("event_id", event_id).execute()
+            except Exception as e:
+                print(f"[rzp-webhook] webhook_events stale-status update "
+                      f"failed (non-blocking): {e}")
+            return jsonify({"ok": True, "skipped_stale": True,
+                            "reason": stale_reason,
+                            "event_type": event_type}), 200
+
         try:
             supa.table("users").update(update_fields).eq("id", user_id).execute()
-            print(f"[rzp-webhook] [OK] event={event_type} user={user_id} sub={subscription_id} {extra_log}")
+            print(f"[rzp-webhook] [OK] event={event_type} user={user_id} sub={subscription_id} {extra_log} (stale-check={stale_reason})")
         except Exception as e:
             err_str = str(e)[:200]
             print(f"[rzp-webhook] DB update failed for user={user_id}: {err_str}")
@@ -3735,9 +3874,32 @@ def paypal_webhook():
 
     # 10. Apply DB update if any
     if update_fields is not None:
+        # CME-1 fix: same staleness gate as Razorpay. PayPal's activation
+        # event is BILLING.SUBSCRIPTION.ACTIVATED. PAYMENT.SALE.COMPLETED
+        # (renewal) is NOT activation — those need sub_id match.
+        is_activation = (event_type == "BILLING.SUBSCRIPTION.ACTIVATED")
+        should_apply, stale_reason = _should_apply_webhook(
+            supa, user_id, subscription_id, is_activation
+        )
+        if not should_apply:
+            # Webhook is stale — record audit trail and accept (200) so
+            # PayPal doesn't retry. The actual user state is unchanged.
+            try:
+                supa.table("webhook_events").update({
+                    "status": stale_reason,
+                    "user_id": user_id,
+                    "processed_at": _paypal_iso_now(),
+                }).eq("event_id", event_id).execute()
+            except Exception as e:
+                print(f"[pp-webhook] webhook_events stale-status update "
+                      f"failed (non-blocking): {e}")
+            return jsonify({"ok": True, "skipped_stale": True,
+                            "reason": stale_reason,
+                            "event_type": event_type}), 200
+
         try:
             supa.table("users").update(update_fields).eq("id", user_id).execute()
-            print(f"[pp-webhook] [OK] event={event_type} user={user_id} sub={subscription_id} {extra_log}")
+            print(f"[pp-webhook] [OK] event={event_type} user={user_id} sub={subscription_id} {extra_log} (stale-check={stale_reason})")
         except Exception as e:
             err_str = str(e)[:200]
             print(f"[pp-webhook] DB update failed for user={user_id}: {err_str}")
@@ -3825,6 +3987,10 @@ def auth_debug():
             "me_subscription_get":     True,
             "me_cancel_subscription":  True,
         },
+        # ---- CME-1 webhook race-condition fix ----
+        # When True, both Razorpay & PayPal webhook handlers gate UPDATE
+        # writes on subscription_id match (with activation override).
+        "cme1_webhook_staleness_check": True,
     })
 
 
