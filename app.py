@@ -4011,15 +4011,18 @@ def auth_debug():
 #   - Accept: text/html  → returns HTML dashboard (browser-friendly)
 #   - Anything else      → returns JSON (cron + curl friendly)
 #
-# Alert conditions (ANY triggers alert=true):
+# Alert conditions (ANY triggers alert=true and HTTP 503):
 #   1. ANY 'failed' webhook events in last 7 days
 #   2. ANY 'applied_no_match_warned' events in last 7 days (orphan rows)
 #   3. >5 'ignored_stale_*' events in last 24h (race firing too often)
 #
-# The endpoint always returns HTTP 200 — even on internal errors, it sets
-# alert=true with a reason. This is intentional: cron services often
-# treat 5xx as transient and won't email on them, so we keep status 200
-# and put the alarm signal in the body where the keyword-match runs.
+# HTTP status semantics:
+#   200 — alert=false (healthy). cron-job.org logs as success.
+#   503 — alert=true (something needs attention). cron-job.org fires the
+#         failure-notification email. On recovery (next 200), it fires
+#         a "recovered" email so you know it's resolved.
+#   403 — auth header missing/wrong. NOT an alert state, just a bad
+#         request. Won't trigger cron-job.org's persistent-failure flow.
 # ============================================================
 @app.route("/api/webhook-health", methods=["GET", "OPTIONS"])
 def webhook_health():
@@ -4042,12 +4045,15 @@ def webhook_health():
 
     supa = _get_supabase()
     if supa is None:
+        # Supabase missing — we can't audit. Return 503 so cron-job.org's
+        # failure-notification fires and emails the owner. The alert
+        # signal is also in the body for human inspection.
         return jsonify({
             "ok": True,
             "alert": True,
-            "alert_reason": "supabase_client_unavailable",
+            "alert_reasons": ["supabase_client_unavailable"],
             "checked_at": _now_utc().isoformat(),
-        }), 200
+        }), 503
 
     # Collect counts. Three windows:
     #   24h — for the spike threshold
@@ -4140,8 +4146,14 @@ def webhook_health():
     accept = (request.headers.get("Accept") or "").lower()
     wants_html = "text/html" in accept
 
+    # HTTP status: alert → 503 so cron-job.org's failure-notification
+    # fires and emails the owner. Clean state → 200. The endpoint still
+    # responds successfully in both cases — the status code is purely
+    # a signaling mechanism for external monitoring.
+    status_code = 503 if alert else 200
+
     if not wants_html:
-        return jsonify(payload), 200
+        return jsonify(payload), status_code
 
     # ---- HTML rendering ----
     # Minimal, no-CSS-framework dashboard. Two tables, status banner at top.
@@ -4196,7 +4208,7 @@ Thresholds: alert if <code>failed</code> &gt; 0 in 7d, OR <code>applied_no_match
 Healthy distribution: most events as <code>processed</code> or <code>applied</code>; a few <code>ignored_stale_sub</code> is fine (CME-1 fix working); zero <code>failed</code>.
 </div>
 </body></html>"""
-    return Response(html, mimetype="text/html"), 200
+    return Response(html, mimetype="text/html"), status_code
 
 
 def _html_escape(s):
