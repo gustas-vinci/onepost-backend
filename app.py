@@ -338,6 +338,110 @@ def _check_subscription_conflict(supa, user_id, requested_provider, requested_ti
 
 
 # ============================================================
+# DEFENSIVE CANCEL — used by force_resubscribe path
+# ------------------------------------------------------------
+# When a user clicks "Resume subscription" or "Switch plan" from My
+# Account (with force_resubscribe=true), we want to ensure the OLD
+# subscription at the provider is definitively cancelled before
+# creating a new one. The old sub is usually already cancelled (the
+# user got here via the Manage modal which only shows Resume/Switch
+# for cancelled state) — but a defensive double-cancel costs us
+# one API call and guarantees zero chance of a stray rebill.
+#
+# Safe to call on already-cancelled subs — providers either no-op
+# or return a benign error (which we swallow).
+#
+# Never raises. Logs loudly on real failures but doesn't block the
+# caller — the new subscription should proceed regardless.
+# ============================================================
+def _defensive_cancel_existing(supa, user_id):
+    """Read user row → if subscription_id + payment_provider exist, call
+    cancel on that sub at the provider. Best-effort. Never raises."""
+    if supa is None or not user_id:
+        return
+    try:
+        res = (supa.table("users")
+               .select("subscription_id, payment_provider, subscription_status")
+               .eq("id", user_id)
+               .limit(1)
+               .execute())
+        row = res.data[0] if res.data and len(res.data) > 0 else None
+    except Exception as e:
+        print(f"[defensive-cancel] DB read failed for user={user_id}: {e}")
+        return
+    if not row:
+        return
+    old_sub_id = (row.get("subscription_id") or "").strip()
+    old_provider = (row.get("payment_provider") or "").strip().lower()
+    if not old_sub_id or not old_provider:
+        return  # nothing to cancel
+
+    if old_provider == "razorpay":
+        rzp = _get_razorpay()
+        if rzp is None:
+            print(f"[defensive-cancel] razorpay client unavailable; "
+                  f"skipping for user={user_id}")
+            return
+        try:
+            rzp.subscription.cancel(old_sub_id, {"cancel_at_cycle_end": 0})
+            print(f"[defensive-cancel] razorpay cancel OK: user={user_id} "
+                  f"sub={old_sub_id}")
+        except Exception as e:
+            # Already-cancelled / completed / halted subs throw here — that's
+            # the expected case in this code path (we're in "resume cancelled"
+            # mode). Swallow + log at info level so it doesn't look like a bug
+            # in the Render log stream.
+            err_short = str(e)[:120]
+            # Common phrases providers return for already-terminal subs
+            looks_terminal = any(s in err_short.lower() for s in (
+                "cancelled", "canceled", "completed", "expired", "not found",
+                "already", "halted"
+            ))
+            if looks_terminal:
+                print(f"[defensive-cancel] razorpay sub already terminal "
+                      f"(expected); proceeding: user={user_id} sub={old_sub_id}")
+            else:
+                # Genuinely unexpected error — log loudly
+                print(f"[defensive-cancel] razorpay cancel UNEXPECTED error "
+                      f"(proceeding anyway): user={user_id} sub={old_sub_id} "
+                      f"err={err_short}")
+    elif old_provider == "paypal":
+        access_token = _get_paypal_access_token()
+        if not access_token:
+            print(f"[defensive-cancel] paypal token unavailable; "
+                  f"skipping for user={user_id}")
+            return
+        try:
+            import requests as _requests
+            resp = _requests.post(
+                f"{_PAYPAL_API_BASE}/v1/billing/subscriptions/{old_sub_id}/cancel",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json={"reason": "User initiated resubscribe via OnePost "
+                                "My Account"},
+                timeout=15,
+            )
+            # 204 = success, 422 = already terminal. Both are fine here.
+            if resp.status_code in (204, 422):
+                print(f"[defensive-cancel] paypal cancel OK "
+                      f"(HTTP {resp.status_code}): user={user_id} "
+                      f"sub={old_sub_id}")
+            else:
+                print(f"[defensive-cancel] paypal cancel unexpected status "
+                      f"{resp.status_code}: user={user_id} sub={old_sub_id} "
+                      f"body={resp.text[:160]}")
+        except Exception as e:
+            print(f"[defensive-cancel] paypal cancel exception "
+                  f"(proceeding): user={user_id} sub={old_sub_id} err={e}")
+    else:
+        print(f"[defensive-cancel] unknown provider={old_provider!r} for "
+              f"user={user_id}; skipping")
+
+
+# ============================================================
 # ANTI-ABUSE — Email normalization (Layer A: catches Tier 2 abuse)
 # ============================================================
 # Gmail and Googlemail treat dots and +aliases as identical:
@@ -2338,6 +2442,11 @@ def razorpay_create_subscription():
         body = {}
     tier = (body.get("tier") or "").strip().lower()
     cycle = (body.get("cycle") or "").strip().lower()
+    # force_resubscribe: set by frontend when user explicitly chose to
+    # resume/switch from My Account. Bypasses conflict guard and runs a
+    # defensive cancel on the prior sub. Default False — random Subscribe
+    # clicks from pricing cards never bypass the guard.
+    force_resubscribe = bool(body.get("force_resubscribe"))
     if tier not in {"creator", "pro", "agency"}:
         return jsonify({"ok": False, "error": "bad_request",
                         "detail": f"invalid tier: {tier!r}"}), 400
@@ -2362,21 +2471,28 @@ def razorpay_create_subscription():
     if supa is None:
         return jsonify({"ok": False, "error": "supabase_unavailable"}), 503
 
-    # 5b. Conflict check: prevent users from accidentally double-subscribing.
-    # If user has an active subscription with a different provider or tier,
-    # block this request and ask them to cancel the existing one first.
-    conflict = _check_subscription_conflict(supa, user_id, "razorpay", tier, cycle)
-    if conflict:
-        print(f"[rzp-checkout] conflict for user={user_id}: {conflict['reason']}")
-        return jsonify({
-            "ok": False,
-            "error": "subscription_conflict",
-            "detail": conflict["reason"],
-            "existing_provider": conflict["existing_provider"],
-            "existing_tier": conflict["existing_tier"],
-            "existing_subscription_status": conflict.get("existing_subscription_status", ""),
-            "current_period_end": conflict["current_period_end"],
-        }), 409  # 409 Conflict — semantically correct status code
+    # 5b. Conflict check OR explicit-resubscribe path.
+    if force_resubscribe:
+        # User explicitly chose to resume/switch from My Account. Trust them:
+        # skip the conflict guard, but defensively cancel the OLD provider
+        # subscription first to guarantee no stray rebill on the abandoned sub.
+        print(f"[rzp-checkout] force_resubscribe=True for user={user_id} — "
+              f"running defensive cancel before creating new sub")
+        _defensive_cancel_existing(supa, user_id)
+    else:
+        # Normal path: enforce conflict guard.
+        conflict = _check_subscription_conflict(supa, user_id, "razorpay", tier, cycle)
+        if conflict:
+            print(f"[rzp-checkout] conflict for user={user_id}: {conflict['reason']}")
+            return jsonify({
+                "ok": False,
+                "error": "subscription_conflict",
+                "detail": conflict["reason"],
+                "existing_provider": conflict["existing_provider"],
+                "existing_tier": conflict["existing_tier"],
+                "existing_subscription_status": conflict.get("existing_subscription_status", ""),
+                "current_period_end": conflict["current_period_end"],
+            }), 409  # 409 Conflict — semantically correct status code
 
     # 6. Create the subscription via Razorpay API
     # total_count = number of billing cycles before Razorpay auto-stops the subscription.
@@ -2501,6 +2617,10 @@ def paypal_create_subscription():
         body = {}
     tier = (body.get("tier") or "").strip().lower()
     cycle = (body.get("cycle") or "").strip().lower()
+    # force_resubscribe: set by frontend when user explicitly chose to
+    # resume/switch from My Account. Bypasses conflict guard and runs a
+    # defensive cancel on the prior sub. See Razorpay endpoint for full notes.
+    force_resubscribe = bool(body.get("force_resubscribe"))
     if tier not in {"creator", "pro", "agency"}:
         return jsonify({"ok": False, "error": "bad_request",
                         "detail": f"invalid tier: {tier!r}"}), 400
@@ -2525,21 +2645,24 @@ def paypal_create_subscription():
     if supa is None:
         return jsonify({"ok": False, "error": "supabase_unavailable"}), 503
 
-    # 5b. Conflict check: prevent users from accidentally double-subscribing.
-    # If user has an active subscription with a different provider or tier,
-    # block this request and ask them to cancel the existing one first.
-    conflict = _check_subscription_conflict(supa, user_id, "paypal", tier, cycle)
-    if conflict:
-        print(f"[pp-checkout] conflict for user={user_id}: {conflict['reason']}")
-        return jsonify({
-            "ok": False,
-            "error": "subscription_conflict",
-            "detail": conflict["reason"],
-            "existing_provider": conflict["existing_provider"],
-            "existing_tier": conflict["existing_tier"],
-            "existing_subscription_status": conflict.get("existing_subscription_status", ""),
-            "current_period_end": conflict["current_period_end"],
-        }), 409  # 409 Conflict — semantically correct status code
+    # 5b. Conflict check OR explicit-resubscribe path.
+    if force_resubscribe:
+        print(f"[pp-checkout] force_resubscribe=True for user={user_id} — "
+              f"running defensive cancel before creating new sub")
+        _defensive_cancel_existing(supa, user_id)
+    else:
+        conflict = _check_subscription_conflict(supa, user_id, "paypal", tier, cycle)
+        if conflict:
+            print(f"[pp-checkout] conflict for user={user_id}: {conflict['reason']}")
+            return jsonify({
+                "ok": False,
+                "error": "subscription_conflict",
+                "detail": conflict["reason"],
+                "existing_provider": conflict["existing_provider"],
+                "existing_tier": conflict["existing_tier"],
+                "existing_subscription_status": conflict.get("existing_subscription_status", ""),
+                "current_period_end": conflict["current_period_end"],
+            }), 409  # 409 Conflict — semantically correct status code
 
     # 6. Build return URLs (where PayPal sends user after approve/cancel)
     # Frontend reads ?subscribed=1&tier=X to show welcome, ?cancelled=1 for cancel page.
