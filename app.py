@@ -274,29 +274,61 @@ def _check_subscription_conflict(supa, user_id, requested_provider, requested_ti
     existing_tier = (row.get("tier") or "free").strip().lower()
     existing_period_end = row.get("current_period_end") or ""
 
-    # Only "active" subscriptions create conflicts. Cancelled/halted/expired/created
-    # are dead or pending — user can freely subscribe over them.
-    if status != "active":
-        return None
+    # ----------------------------------------------------------------
+    # New rule (Phase 2 Day 5 fix): block any new checkout while the
+    # user still has paid access, regardless of subscription_status.
+    #
+    # Why: previously we only blocked when status='active', which meant
+    # a 'cancelled' user with a future period_end could start a new
+    # checkout. That overwrites the existing subscription_id / plan_id /
+    # payment_provider on their user row — destroying our handle to the
+    # original (still-billing-or-just-cancelled) subscription. The user
+    # ends up in a confusing state: we can't show them their real
+    # subscription, and our /api/me/cancel-subscription would call the
+    # wrong provider's API.
+    #
+    # New behavior:
+    #   - If user has tier='free' OR period has expired → no conflict.
+    #     The lazy-create / webhook path handles transitions cleanly.
+    #   - Otherwise (paid tier + future period_end): the user already
+    #     has access. Force them to either wait for period_end or use
+    #     My Account → Cancel to reset state explicitly.
+    # ----------------------------------------------------------------
 
-    # Defense-in-depth: also verify period is still in the future. If period_end has
-    # passed but webhook hasn't downgraded yet, we should let them resubscribe.
+    # No paid access right now → no conflict
+    if existing_tier == "free":
+        return None
     if existing_period_end and not _is_period_active(existing_period_end):
         return None
+    if not existing_period_end:
+        # Paid tier but no period date — odd state (likely halted/expired
+        # without a date stamp). Fall back to the old status-only check:
+        # only block if currently active.
+        if status != "active":
+            return None
 
-    # If user is trying the EXACT same tier+provider, no real conflict — just a retry.
-    # We allow this (the redundant subscription will be orphaned at the provider's
-    # end, harmlessly auto-cleaned).
+    # User has live paid access (period in the future). Allow ONLY the
+    # narrow same-tier + same-provider + active retry case. Every other
+    # case (different tier, different provider, cancelled, paused, halted,
+    # created — anything) is blocked.
     requested_provider_norm = (requested_provider or "").strip().lower()
-    if existing_provider == requested_provider_norm and existing_tier == (requested_tier or "").strip().lower():
+    requested_tier_norm = (requested_tier or "").strip().lower()
+    is_same_tier_provider = (
+        existing_provider == requested_provider_norm
+        and existing_tier == requested_tier_norm
+    )
+    if status == "active" and is_same_tier_provider:
+        # Legitimate retry of the exact same subscription — redundant request
+        # is harmlessly orphaned at the provider's end.
         return None
 
-    # Genuine conflict: user has an active subscription, and they're trying to
-    # subscribe to something different. Block.
+    # Genuine conflict: user has live paid access, and the new checkout would
+    # overwrite the existing subscription's metadata.
     return {
         "existing_provider": existing_provider,
         "existing_tier": existing_tier,
         "existing_subscription_id": (row.get("subscription_id") or "").strip(),
+        "existing_subscription_status": status,
         "current_period_end": existing_period_end,
         "reason": (
             f"already_subscribed_to_{existing_tier}_via_{existing_provider}"
@@ -710,6 +742,10 @@ def _get_user_quota(supa, user_id):
                 return _quota_fallback(user_id, "no_user_row_lazy_failed")
         row = res.data[0]
         tier = (row.get("tier") or "free").strip().lower()
+        # Surface subscription_status so the frontend can render nuanced UI
+        # (e.g. "Active until Jun 9" for cancelled-but-still-paid users).
+        # Empty string when user has no subscription history.
+        sub_status = (row.get("subscription_status") or "").strip().lower()
         limits = _get_tier_limits(tier)
 
         # ---- Period-end safety net (defense-in-depth for paid tiers) ----
@@ -752,6 +788,7 @@ def _get_user_quota(supa, user_id):
             return {
                 "ok": True, "user_id": user_id,
                 "tier": "free", "kind": "daily",
+                "subscription_status": sub_status,
                 "daily_used": daily_used, "daily_limit": limits["daily"],
                 "bonus_credits": bonus_credits,
                 "daily_remaining": daily_remaining,
@@ -770,6 +807,7 @@ def _get_user_quota(supa, user_id):
             return {
                 "ok": True, "user_id": user_id,
                 "tier": tier, "kind": "monthly",
+                "subscription_status": sub_status,
                 # Free-tier fields zeroed for paid users
                 "daily_used": 0, "daily_limit": 0,
                 "bonus_credits": 0, "daily_remaining": 0,
@@ -1641,6 +1679,7 @@ def check_quota():
                     # Paid-tier fields (zero for free users — frontend uses 'kind' to branch)
                     "tier": state["tier"],
                     "kind": state["kind"],
+                    "subscription_status": state.get("subscription_status", ""),
                     "monthly_used": state["monthly_used"],
                     "monthly_limit": state["monthly_limit"],
                     "monthly_remaining": state["monthly_remaining"],
@@ -2335,6 +2374,7 @@ def razorpay_create_subscription():
             "detail": conflict["reason"],
             "existing_provider": conflict["existing_provider"],
             "existing_tier": conflict["existing_tier"],
+            "existing_subscription_status": conflict.get("existing_subscription_status", ""),
             "current_period_end": conflict["current_period_end"],
         }), 409  # 409 Conflict — semantically correct status code
 
@@ -2497,6 +2537,7 @@ def paypal_create_subscription():
             "detail": conflict["reason"],
             "existing_provider": conflict["existing_provider"],
             "existing_tier": conflict["existing_tier"],
+            "existing_subscription_status": conflict.get("existing_subscription_status", ""),
             "current_period_end": conflict["current_period_end"],
         }), 409  # 409 Conflict — semantically correct status code
 
