@@ -7,7 +7,7 @@ import threading
 import requests
 from collections import deque
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 
 load_dotenv()
@@ -3991,7 +3991,226 @@ def auth_debug():
         # When True, both Razorpay & PayPal webhook handlers gate UPDATE
         # writes on subscription_id match (with activation override).
         "cme1_webhook_staleness_check": True,
+        # ---- /api/webhook-health auth secret ----
+        # Required to be set before configuring the external cron job.
+        "webhook_health_key_set": bool((os.getenv("WEBHOOK_HEALTH_KEY") or "").strip()),
     })
+
+
+# ============================================================
+# /api/webhook-health — operational audit endpoint
+# ------------------------------------------------------------
+# Periodic health check for webhook processing. Designed to be pinged
+# every 48h by an external cron service (cron-job.org) which will email
+# the owner if the response contains "alert":true.
+#
+# Auth: requires X-Health-Key header matching WEBHOOK_HEALTH_KEY env var.
+# Set this env var on Render BEFORE configuring the cron job.
+#
+# Content negotiation:
+#   - Accept: text/html  → returns HTML dashboard (browser-friendly)
+#   - Anything else      → returns JSON (cron + curl friendly)
+#
+# Alert conditions (ANY triggers alert=true):
+#   1. ANY 'failed' webhook events in last 7 days
+#   2. ANY 'applied_no_match_warned' events in last 7 days (orphan rows)
+#   3. >5 'ignored_stale_*' events in last 24h (race firing too often)
+#
+# The endpoint always returns HTTP 200 — even on internal errors, it sets
+# alert=true with a reason. This is intentional: cron services often
+# treat 5xx as transient and won't email on them, so we keep status 200
+# and put the alarm signal in the body where the keyword-match runs.
+# ============================================================
+@app.route("/api/webhook-health", methods=["GET", "OPTIONS"])
+def webhook_health():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+
+    # Auth: shared secret header. Don't accept query-string version —
+    # that would leak the key into Render request logs.
+    expected_key = (os.getenv("WEBHOOK_HEALTH_KEY") or "").strip()
+    if not expected_key:
+        # Env var not configured. Refuse politely instead of returning data.
+        return jsonify({
+            "ok": False,
+            "error": "WEBHOOK_HEALTH_KEY env var not set on backend"
+        }), 503
+    provided_key = (request.headers.get("X-Health-Key") or "").strip()
+    if provided_key != expected_key:
+        # Don't 401 — that triggers cron retry logic. Just refuse with 403.
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    supa = _get_supabase()
+    if supa is None:
+        return jsonify({
+            "ok": True,
+            "alert": True,
+            "alert_reason": "supabase_client_unavailable",
+            "checked_at": _now_utc().isoformat(),
+        }), 200
+
+    # Collect counts. Three windows:
+    #   24h — for the spike threshold
+    #   7d  — for the broad health view
+    #   total — sanity check the table has data at all
+    from datetime import timedelta
+    now = _now_utc()
+    iso_24h = (now - timedelta(hours=24)).isoformat()
+    iso_7d  = (now - timedelta(days=7)).isoformat()
+
+    # Try a robust fetch. If anything fails, set alert=true with the reason
+    # rather than crashing.
+    counts_7d = {}
+    counts_24h = {}
+    total_ever = 0
+    audit_error = ""
+    try:
+        # Pull all rows from last 7 days, group in Python (small data, OK).
+        # Supabase Python client doesn't support GROUP BY directly — we'd
+        # need an RPC for that. Fetching raw rows is fine at this scale.
+        res_7d = (supa.table("webhook_events")
+                  .select("status, received_at")
+                  .gte("received_at", iso_7d)
+                  .execute())
+        rows = res_7d.data or []
+        for r in rows:
+            s = (r.get("status") or "unknown")
+            counts_7d[s] = counts_7d.get(s, 0) + 1
+            ra = r.get("received_at") or ""
+            if ra >= iso_24h:
+                counts_24h[s] = counts_24h.get(s, 0) + 1
+
+        # Total count of webhook_events ever (sanity check, small table)
+        # We use a HEAD-style count if Supabase client supports it. Falling
+        # back to a simple list query bounded by limit=1 if not, for which
+        # we won't get the total. Safer to omit on failure.
+        try:
+            res_total = (supa.table("webhook_events")
+                         .select("event_id", count="exact")
+                         .limit(1)
+                         .execute())
+            total_ever = int(getattr(res_total, "count", 0) or 0)
+        except Exception:
+            total_ever = -1  # signal "unknown" without crashing
+    except Exception as e:
+        audit_error = str(e)[:200]
+        print(f"[webhook-health] audit query failed: {audit_error}")
+
+    # Decide alert state
+    alert = False
+    alert_reasons = []
+
+    if audit_error:
+        alert = True
+        alert_reasons.append(f"audit_query_failed: {audit_error}")
+
+    failed_7d = counts_7d.get("failed", 0)
+    if failed_7d > 0:
+        alert = True
+        alert_reasons.append(f"failed_events_7d={failed_7d}")
+
+    orphan_7d = counts_7d.get("applied_no_match_warned", 0)
+    if orphan_7d > 0:
+        alert = True
+        alert_reasons.append(f"orphan_rows_7d={orphan_7d}")
+
+    stale_24h = (counts_24h.get("ignored_stale_sub", 0)
+                 + counts_24h.get("ignored_stale_active", 0))
+    if stale_24h > 5:
+        alert = True
+        alert_reasons.append(f"stale_race_24h={stale_24h}_exceeds_threshold_5")
+
+    # Build the response payload
+    payload = {
+        "ok": True,
+        "alert": alert,
+        "alert_reasons": alert_reasons,
+        "checked_at": now.isoformat(),
+        "window_24h": counts_24h,
+        "window_7d": counts_7d,
+        "total_ever": total_ever,
+        "thresholds": {
+            "stale_24h_max": 5,
+            "failed_7d_max": 0,
+            "orphan_7d_max": 0,
+        },
+    }
+
+    # Content negotiation. Browser → HTML dashboard. Everything else → JSON.
+    accept = (request.headers.get("Accept") or "").lower()
+    wants_html = "text/html" in accept
+
+    if not wants_html:
+        return jsonify(payload), 200
+
+    # ---- HTML rendering ----
+    # Minimal, no-CSS-framework dashboard. Two tables, status banner at top.
+    # All untrusted content is integer counts, so HTML escaping isn't
+    # strictly required, but we _str() everything anyway for safety.
+    def _row(status_name, count_7d, count_24h):
+        return (f"<tr><td>{_html_escape(status_name)}</td>"
+                f"<td style='text-align:right'>{int(count_24h)}</td>"
+                f"<td style='text-align:right'>{int(count_7d)}</td></tr>")
+
+    # Union of statuses seen in either window, sorted by 7d count desc.
+    all_statuses = set(counts_7d.keys()) | set(counts_24h.keys())
+    sorted_statuses = sorted(all_statuses,
+                             key=lambda s: counts_7d.get(s, 0),
+                             reverse=True)
+    rows_html = "".join(
+        _row(s, counts_7d.get(s, 0), counts_24h.get(s, 0))
+        for s in sorted_statuses
+    ) or "<tr><td colspan='3' style='text-align:center;color:#888'>No webhook events in this window.</td></tr>"
+
+    banner_bg = "#d73a49" if alert else "#28a745"
+    banner_text = ("⚠ ALERT — " + "; ".join(alert_reasons)) if alert else "✓ All clear"
+    reasons_html = ("<ul>" + "".join(f"<li>{_html_escape(r)}</li>" for r in alert_reasons) + "</ul>") if alert_reasons else ""
+
+    html = f"""<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>OnePost — Webhook Health</title>
+<style>
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem;color:#24292e}}
+  h1{{font-size:1.5rem;margin-bottom:0.25rem}}
+  .meta{{color:#586069;font-size:0.85rem;margin-bottom:1rem}}
+  .banner{{background:{banner_bg};color:#fff;padding:0.75rem 1rem;border-radius:6px;font-weight:600;margin:1rem 0}}
+  table{{width:100%;border-collapse:collapse;margin:1rem 0}}
+  th,td{{padding:0.5rem 0.75rem;border-bottom:1px solid #e1e4e8;font-size:0.95rem}}
+  th{{background:#f6f8fa;text-align:left;font-weight:600}}
+  th:nth-child(2),th:nth-child(3){{text-align:right}}
+  .footer{{color:#586069;font-size:0.8rem;margin-top:2rem;border-top:1px solid #e1e4e8;padding-top:0.75rem}}
+  code{{background:#f6f8fa;padding:0.1rem 0.3rem;border-radius:3px;font-size:0.85rem}}
+</style>
+</head><body>
+<h1>OnePost — Webhook Health</h1>
+<div class="meta">Checked at {_html_escape(now.isoformat())} · Total events ever: {int(total_ever) if total_ever >= 0 else "unknown"}</div>
+<div class="banner">{_html_escape(banner_text)}</div>
+{reasons_html}
+<table>
+<thead><tr><th>Status</th><th>Last 24h</th><th>Last 7 days</th></tr></thead>
+<tbody>{rows_html}</tbody>
+</table>
+<div class="footer">
+Thresholds: alert if <code>failed</code> &gt; 0 in 7d, OR <code>applied_no_match_warned</code> &gt; 0 in 7d, OR <code>ignored_stale_*</code> &gt; 5 in 24h.<br>
+Healthy distribution: most events as <code>processed</code> or <code>applied</code>; a few <code>ignored_stale_sub</code> is fine (CME-1 fix working); zero <code>failed</code>.
+</div>
+</body></html>"""
+    return Response(html, mimetype="text/html"), 200
+
+
+def _html_escape(s):
+    """Minimal HTML-escape for safety in the dashboard. Standard library
+    `html.escape` would work, but we keep it inline so this endpoint has
+    no extra imports at module top."""
+    if s is None:
+        return ""
+    return (str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&#39;"))
 
 
 if __name__ == "__main__":
