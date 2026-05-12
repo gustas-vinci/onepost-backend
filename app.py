@@ -7,10 +7,84 @@ import threading
 import requests
 from collections import deque
 from dotenv import load_dotenv
+
+# Load .env BEFORE Sentry init so SENTRY_DSN is available in local dev.
+load_dotenv()
+
+# ============================================================
+# SENTRY ERROR MONITORING — initialized BEFORE Flask
+# ------------------------------------------------------------
+# Must run before `app = Flask(__name__)` so Sentry's FlaskIntegration
+# can hook into the WSGI app at construction time and capture every
+# unhandled exception with full request context (URL, method, headers,
+# user, payload).
+#
+# Behavior:
+#   - If SENTRY_DSN env var is set: Sentry SDK initializes and reports
+#     errors. The init wraps Flask, requests, and stdlib logging.
+#   - If SENTRY_DSN is missing (e.g. local dev without a key): we log
+#     a single line and continue. The app runs identically; we just
+#     don't get error reports. NEVER crashes the app on missing DSN.
+#   - If sentry_sdk is not installed: same fail-soft behavior.
+#
+# The DSN itself is treated as a "shared secret" (it's not truly secret
+# — it appears in the browser bundle for frontend Sentry — but we read
+# it from env on the backend so we can rotate without code changes).
+# ============================================================
+_SENTRY_OK = False
+_SENTRY_ERR = ""
+try:
+    _sentry_dsn = (os.getenv("SENTRY_DSN") or "").strip()
+    if _sentry_dsn:
+        import sentry_sdk
+        from sentry_sdk.integrations.flask import FlaskIntegration
+        sentry_sdk.init(
+            dsn=_sentry_dsn,
+            # Environment tag — useful for filtering prod vs dev errors in
+            # Sentry's UI. Defaults to 'production' since this code lives
+            # on Render; override locally via SENTRY_ENVIRONMENT=development.
+            environment=os.getenv("SENTRY_ENVIRONMENT", "production"),
+            # Release tag — lets Sentry group errors by deploy. If we ever
+            # wire a git SHA via env var, this surfaces it. Falls back to
+            # an empty string (Sentry will assign a default) if not set.
+            release=os.getenv("SENTRY_RELEASE", ""),
+            integrations=[FlaskIntegration()],
+            # Sample rates:
+            #   traces_sample_rate=0   — performance/tracing OFF. We only
+            #     want errors right now; tracing costs quota and adds noise.
+            #   profiles_sample_rate=0 — profiling OFF for the same reason.
+            traces_sample_rate=0.0,
+            profiles_sample_rate=0.0,
+            # PII handling: send_default_pii=False means Sentry will NOT
+            # auto-attach IP addresses or request bodies. We add user_id
+            # context manually elsewhere when useful, never raw PII.
+            send_default_pii=False,
+            # Capture stdlib logging at ERROR level too (Flask's default
+            # logger). WARNINGs are dropped to keep quota in check.
+            # NOTE: print() calls are NOT captured — only `logging.error`.
+            attach_stacktrace=True,
+            # Drop noisy errors we don't care about. Add patterns here as
+            # they surface in production. Match against the exception type
+            # name OR the message string.
+            ignore_errors=[
+                # KeyboardInterrupt only fires during local dev (Ctrl+C).
+                "KeyboardInterrupt",
+                # SystemExit fires during Render graceful shutdowns.
+                "SystemExit",
+            ],
+        )
+        _SENTRY_OK = True
+        print(f"[sentry] initialized — environment={os.getenv('SENTRY_ENVIRONMENT', 'production')}")
+    else:
+        _SENTRY_ERR = "SENTRY_DSN not set"
+        print(f"[sentry] {_SENTRY_ERR} — error monitoring disabled")
+except Exception as _sentry_err:
+    _SENTRY_ERR = f"init_failed: {str(_sentry_err)[:160]}"
+    print(f"[sentry] {_SENTRY_ERR}")
+
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 
-load_dotenv()
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
@@ -4152,7 +4226,69 @@ def auth_debug():
         # ---- /api/webhook-health auth secret ----
         # Required to be set before configuring the external cron job.
         "webhook_health_key_set": bool((os.getenv("WEBHOOK_HEALTH_KEY") or "").strip()),
+        # ---- Sentry error monitoring ----
+        # Two booleans here so we can distinguish "DSN not configured"
+        # from "DSN configured but init failed at import time".
+        "sentry_dsn_set":  bool((os.getenv("SENTRY_DSN") or "").strip()),
+        "sentry_active":   _SENTRY_OK,
     })
+
+
+# ============================================================
+# /api/sentry-test — Sentry verification endpoint
+# ------------------------------------------------------------
+# Triggers a controlled error so we can confirm Sentry is wired
+# correctly end-to-end. Used once during initial setup; safe to
+# leave in place (auth-gated so randos can't spam our error quota).
+#
+# Auth: requires X-Sentry-Test-Key header matching SENTRY_TEST_KEY
+# env var. If SENTRY_TEST_KEY is not set, endpoint returns 503 so
+# it can't be abused before the operator opts in.
+#
+# Two trigger modes via ?mode= query param:
+#   message  — captures a Sentry message (info-level, no stack trace)
+#   error    — raises ZeroDivisionError, captured as a real exception
+#              (default; this is what you want for the smoke test)
+#
+# Returns 200 with the Sentry event ID on success (so you can search
+# for it in the dashboard). Returns 503 if Sentry isn't initialized.
+# ============================================================
+@app.route("/api/sentry-test", methods=["GET", "OPTIONS"])
+def sentry_test_endpoint():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    expected_key = (os.getenv("SENTRY_TEST_KEY") or "").strip()
+    if not expected_key:
+        return jsonify({
+            "error": "SENTRY_TEST_KEY env var not set on server",
+            "hint":  "Set it on Render, then retry with the same value as X-Sentry-Test-Key header",
+        }), 503
+    provided_key = (request.headers.get("X-Sentry-Test-Key") or "").strip()
+    if provided_key != expected_key:
+        return jsonify({"error": "invalid X-Sentry-Test-Key"}), 401
+    if not _SENTRY_OK:
+        return jsonify({
+            "error": "Sentry not initialized",
+            "reason": _SENTRY_ERR or "unknown",
+        }), 503
+    mode = (request.args.get("mode") or "error").strip().lower()
+    try:
+        import sentry_sdk as _s
+    except Exception as e:
+        return jsonify({"error": f"sentry_sdk import failed at runtime: {e}"}), 503
+    if mode == "message":
+        event_id = _s.capture_message("OnePost Sentry smoke test (message)", level="info")
+        return jsonify({
+            "ok": True,
+            "mode": "message",
+            "event_id": event_id,
+            "note": "Search this event_id in Sentry dashboard to confirm delivery.",
+        })
+    # mode == "error" (default): raise inside the request handler so
+    # FlaskIntegration captures it automatically with full request context.
+    # We return 500 (Flask's default) — Sentry will tag this as a real
+    # unhandled exception, exactly like a production bug would look.
+    raise ZeroDivisionError("OnePost Sentry smoke test — this is an intentional error, safe to ignore in Sentry")
 
 
 # ============================================================
