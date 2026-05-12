@@ -557,6 +557,140 @@ def _should_apply_webhook(supa, user_id, incoming_sub_id, is_activation):
 
 
 # ============================================================
+# CME-2 — Per-user checkout rate limit
+# ------------------------------------------------------------
+# Defensive rate limit on the checkout-creation endpoints to prevent
+# abuse: each call hits the provider's API (Razorpay/PayPal), creates a
+# subscription record there, and writes to our users table. Without a
+# limit, a malicious or buggy client could spam these calls and burn
+# through provider API quotas, create orphan subs, and churn the row.
+#
+# Spec (decided in session 2026-05-12):
+#   - Limit: 3 attempts per 5 minutes
+#   - Scope: PER USER, PER PROVIDER (Razorpay and PayPal independent)
+#   - Storage: in-memory sliding window (single Render instance, fine)
+#   - Response: HTTP 429 + Retry-After header + JSON with retry_after_seconds
+#   - Logging: every 429 logged so we can spot abuse in Render logs
+#
+# Sliding window vs fixed bucket: sliding avoids the "burst at boundary"
+# problem where a fixed-window allows 2x the rate at boundaries. With a
+# deque of timestamps we get true rate-over-window semantics.
+#
+# Thread safety: gunicorn runs Flask with multiple threads by default;
+# a single global lock protects the dict. Lock contention is negligible
+# at our QPS (rate-limit checks are sub-millisecond).
+#
+# Memory: each user-provider pair holds at most 3 timestamps. Even with
+# 10k active users churning subscriptions, that's <500KB. Pruning of
+# stale entries happens on each check (lazy cleanup).
+#
+# Restart behavior: in-memory state clears on Render restart. Worst
+# case is that a user who just hit the limit gets 3 free retries
+# immediately after a restart. Not a meaningful security gap given how
+# rare restarts are.
+# ============================================================
+_CHECKOUT_RATE_LIMIT_MAX = 3            # max attempts in window
+_CHECKOUT_RATE_LIMIT_WINDOW_SEC = 300   # 5 minutes
+_checkout_rate_state = {}               # {(user_id, provider): deque[float]}
+_checkout_rate_lock = threading.Lock()
+
+
+def _check_checkout_rate_limit(user_id, provider):
+    """Check whether this user has exceeded the checkout rate limit for
+    the given provider. Slides the window forward, prunes old entries.
+
+    Args:
+        user_id: str, the Clerk user_id
+        provider: str, 'razorpay' or 'paypal' (used as the key suffix)
+
+    Returns:
+        (allowed: bool, retry_after_seconds: int)
+        - allowed=True  : within limit, retry_after=0, request can proceed
+        - allowed=False : limit hit, retry_after tells when oldest entry expires
+
+    Side effect when allowed: appends a timestamp to the user's window.
+    (We record the attempt at the gate; if downstream code fails the
+    request for some other reason, the slot is still consumed — that's
+    intentional, prevents retry-loop bypasses.)
+    """
+    if not user_id:
+        # Fail-open if we somehow got called without a user_id. The caller
+        # auth check should reject the request before this point anyway.
+        return True, 0
+
+    key = (user_id, provider)
+    now = time.monotonic()
+    window_start = now - _CHECKOUT_RATE_LIMIT_WINDOW_SEC
+
+    with _checkout_rate_lock:
+        history = _checkout_rate_state.get(key)
+        if history is None:
+            history = deque(maxlen=_CHECKOUT_RATE_LIMIT_MAX + 1)
+            _checkout_rate_state[key] = history
+
+        # Prune timestamps that fell out of the sliding window
+        while history and history[0] < window_start:
+            history.popleft()
+
+        # Decide: if we already have MAX entries inside the window, deny.
+        if len(history) >= _CHECKOUT_RATE_LIMIT_MAX:
+            # Retry-after: how many seconds until the oldest entry expires
+            oldest = history[0]
+            retry_after = int(oldest + _CHECKOUT_RATE_LIMIT_WINDOW_SEC - now) + 1
+            return False, max(retry_after, 1)
+
+        # Allowed — record this attempt and proceed
+        history.append(now)
+        return True, 0
+
+
+def _format_retry_after(seconds):
+    """Convert raw seconds into a humane "try again in ..." phrase.
+    Examples:
+        300 → "5 minutes"
+        180 → "3 minutes"
+        120 → "2 minutes"
+         90 → "2 minutes"    (round up so we don't under-promise)
+         60 → "1 minute"
+         45 → "about a minute"
+         20 → "20 seconds"
+          5 → "a few seconds"
+    Singular/plural handled. Always returns a non-empty string.
+    """
+    s = max(int(seconds or 0), 1)
+    if s < 10:
+        return "a few seconds"
+    if s < 30:
+        return f"{s} seconds"
+    if s < 60:
+        return "about a minute"
+    # 60+ seconds: round UP to the nearest minute so the message is
+    # never optimistic ("1 minute" when there's actually 90s left would
+    # cause a second 429 from a trusting user — bad UX).
+    minutes = (s + 59) // 60
+    return "1 minute" if minutes == 1 else f"{minutes} minutes"
+
+
+def _rate_limited_response(provider, retry_after_seconds):
+    """Build the standard 429 response for a rate-limit hit. Includes
+    Retry-After header (RFC 7231) so well-behaved clients back off, plus
+    a structured JSON body for our frontend to render a clean toast."""
+    humane = _format_retry_after(retry_after_seconds)
+    body = {
+        "ok": False,
+        "error": "rate_limited",
+        "detail": f"Too many checkout attempts. Try again in {humane}.",
+        "retry_after_seconds": retry_after_seconds,  # raw value for programmatic use
+        "retry_after_humane": humane,                 # human-readable form
+        "provider": provider,
+    }
+    resp = jsonify(body)
+    resp.status_code = 429
+    resp.headers["Retry-After"] = str(retry_after_seconds)
+    return resp
+
+
+# ============================================================
 # ANTI-ABUSE — Email normalization (Layer A: catches Tier 2 abuse)
 # ============================================================
 # Gmail and Googlemail treat dots and +aliases as identical:
@@ -2550,6 +2684,16 @@ def razorpay_create_subscription():
         print(f"[rzp-checkout] JWT verification failed: {jwt_err}")
         return jsonify({"ok": False, "error": "unauthorized", "detail": jwt_err}), 401
 
+    # 1b. Rate limit (CME-2): 3 attempts per 5 minutes per user per provider.
+    # Protects against abuse of the create-subscription path which hits
+    # Razorpay's API, creates a subscription, and writes to our DB on
+    # every call. Returns 429 with Retry-After if exceeded.
+    allowed, retry_after = _check_checkout_rate_limit(user_id, "razorpay")
+    if not allowed:
+        print(f"[rzp-checkout] RATE LIMITED user={user_id} "
+              f"retry_after={retry_after}s")
+        return _rate_limited_response("razorpay", retry_after)
+
     # 2. Parse request body
     try:
         body = request.get_json(force=True, silent=True) or {}
@@ -2724,6 +2868,16 @@ def paypal_create_subscription():
     if not user_id:
         print(f"[pp-checkout] JWT verification failed: {jwt_err}")
         return jsonify({"ok": False, "error": "unauthorized", "detail": jwt_err}), 401
+
+    # 1b. Rate limit (CME-2): 3 attempts per 5 minutes per user per provider.
+    # Independent counter from Razorpay's limit so a user CAN switch
+    # providers without hitting a shared cap, but each provider is still
+    # protected from spam.
+    allowed, retry_after = _check_checkout_rate_limit(user_id, "paypal")
+    if not allowed:
+        print(f"[pp-checkout] RATE LIMITED user={user_id} "
+              f"retry_after={retry_after}s")
+        return _rate_limited_response("paypal", retry_after)
 
     # 2. Parse body
     try:
@@ -3991,6 +4145,10 @@ def auth_debug():
         # When True, both Razorpay & PayPal webhook handlers gate UPDATE
         # writes on subscription_id match (with activation override).
         "cme1_webhook_staleness_check": True,
+        # ---- CME-2 checkout rate limit ----
+        # When True, both checkout endpoints rate-limit per user per
+        # provider (3 attempts per 5 minutes, in-memory sliding window).
+        "cme2_checkout_rate_limit": True,
         # ---- /api/webhook-health auth secret ----
         # Required to be set before configuring the external cron job.
         "webhook_health_key_set": bool((os.getenv("WEBHOOK_HEALTH_KEY") or "").strip()),
